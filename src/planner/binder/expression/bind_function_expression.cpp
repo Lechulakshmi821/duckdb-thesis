@@ -142,10 +142,10 @@ BindResult ExpressionBinder::BindLambdaFunction(FunctionExpression &function, Sc
 	// bind the children of the function expression
 	string error;
 
-	if (function.children.size() != 2) {
+	if (function.children.size() < 2) {
 		return BindResult("Invalid function arguments!");
 	}
-	D_ASSERT(function.children[1]->GetExpressionClass() == ExpressionClass::LAMBDA);
+	D_ASSERT(function.children[function.children.size()-1]->GetExpressionClass() == ExpressionClass::LAMBDA);
 
 	// bind the list parameter
 	BindChild(function.children[0], depth, error);
@@ -163,19 +163,19 @@ BindResult ExpressionBinder::BindLambdaFunction(FunctionExpression &function, Sc
 	}
 
 	// bind the lambda parameter
-	auto &lambda_expr = function.children[1]->Cast<LambdaExpression>();
+	auto &lambda_expr = function.children[function.children.size()-1]->Cast<LambdaExpression>();
 	BindResult bind_lambda_result = BindExpression(lambda_expr, depth, true, list_child_type);
 
 	if (bind_lambda_result.HasError()) {
 		error = bind_lambda_result.error;
 	} else {
 		// successfully bound: replace the node with a BoundExpression
-		auto alias = function.children[1]->alias;
+		auto alias = function.children[function.children.size()-1]->alias;
 		bind_lambda_result.expression->alias = alias;
 		if (!alias.empty()) {
 			bind_lambda_result.expression->alias = alias;
 		}
-		function.children[1] = make_uniq<BoundExpression>(std::move(bind_lambda_result.expression));
+		function.children[function.children.size()-1] = make_uniq<BoundExpression>(std::move(bind_lambda_result.expression));
 	}
 
 	if (!error.empty()) {
