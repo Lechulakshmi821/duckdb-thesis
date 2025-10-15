@@ -1,0 +1,3 @@
+[submodule "external/nlproc"]
+	path = external/nlproc
+	url = https://github.com/Lechulakshmi821/NLProc-Proj-M-SS25.git
