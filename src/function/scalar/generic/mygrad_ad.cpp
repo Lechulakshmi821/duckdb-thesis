@@ -1,338 +1,612 @@
-// src/function/scalar/generic/mygrad_ad.cpp
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/common/types/vector.hpp"
+
 #include "duckdb/common/types/value.hpp"
-#include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types.hpp"
 
-#include "duckdb/planner/expression/bound_lambda_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression/bound_operator_expression.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-
-#include "duckdb/common/enums/expression_type.hpp"
-#include "duckdb/common/enums/expression_class.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
 
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace duckdb {
 
-// ==================== Dual number type & ops ====================
-struct AD_Dual { double v; double d; };
-static inline AD_Dual AD_Const(double c) { return {c, 0.0}; }
-static inline AD_Dual AD_Add(AD_Dual a, AD_Dual b) { return {a.v + b.v, a.d + b.d}; }
-static inline AD_Dual AD_Sub(AD_Dual a, AD_Dual b) { return {a.v - b.v, a.d - b.d}; }
-static inline AD_Dual AD_Mul(AD_Dual a, AD_Dual b) { return {a.v * b.v, a.v * b.d + b.v * a.d}; }
-static inline AD_Dual AD_Div(AD_Dual a, AD_Dual b) { return {a.v / b.v, (a.d * b.v - a.v * b.d) / (b.v * b.v)}; }
-static inline AD_Dual AD_Log(AD_Dual x) { return {std::log(x.v), x.d / x.v}; }
-static inline AD_Dual AD_Pow(AD_Dual x, AD_Dual y) {
-	double v = std::pow(x.v, y.v);
-	double d = v * (y.d * std::log(x.v) + y.v * (x.d / x.v));
-	return {v, d};
+// ===========================================================================
+// Helpers
+// ===========================================================================
+static inline double AsDouble(const Value &v) {
+	if (v.IsNull()) return 0.0;
+	Value x = v;
+	if (x.type() != LogicalType::DOUBLE) {
+		x = x.DefaultCastAs(LogicalType::DOUBLE);
+	}
+	return x.GetValue<double>();
 }
-static inline AD_Dual AD_LogBase(AD_Dual x, AD_Dual b) { return AD_Div(AD_Log(x), AD_Log(b)); }
 
-// ==================== helpers ====================
-static string AD_ParamName(idx_t i) {
-	string s; idx_t x = i;
-	while (true) {
-		char c = char('a' + (x % 26));
-		s.insert(s.begin(), c);
-		if (x < 26) break;
-		x = x / 26 - 1;
+static inline std::string ToLower(std::string s) {
+	for (auto &ch : s) ch = (char)std::tolower((unsigned char)ch);
+	return s;
+}
+
+static inline std::string StripQuotes(const std::string &s) {
+	if (s.size() >= 2 && ((s.front()=='\'' && s.back()=='\'') || (s.front()=='"' && s.back()=='"'))) {
+		return s.substr(1, s.size()-2);
 	}
 	return s;
 }
-static double AD_ValueToDouble(const Value &val) {
-	if (val.IsNull()) return 0.0;
-	Value v = val;
-	if (v.type() != LogicalType::DOUBLE) v = v.DefaultCastAs(LogicalType::DOUBLE);
-	return v.GetValue<double>();
+
+static inline std::string TrimCopy(std::string s) {
+	StringUtil::Trim(s); // in-place
+	return s;
 }
 
-// ==================== bind data ====================
-struct ADGradBindData : public FunctionData {
-	vector<LogicalType> input_types;
-	unique_ptr<Expression> body;
-	idx_t param_count;
-	vector<unique_ptr<Expression>> captures;
-	vector<LogicalType> field_types;
+// ===========================================================================
+// Optional lambda header parsing for the TABLE FUNCTION string interface
+// Syntax: "(x,y,price) -> body"   OR   just "body"
+// ===========================================================================
+static void ParseLambdaHeaderIfAny(const std::string &expr_in,
+                                   std::vector<std::string> &param_names,
+                                   std::string &body_out) {
+	std::string s = expr_in; // make mutable
+	StringUtil::Trim(s);
 
-	ADGradBindData(vector<LogicalType> in, unique_ptr<Expression> body_p, idx_t pc,
-	               vector<unique_ptr<Expression>> caps, vector<LogicalType> ftypes)
-	    : input_types(std::move(in)), body(std::move(body_p)), param_count(pc),
-	      captures(std::move(caps)), field_types(std::move(ftypes)) {}
+	const auto arrow = s.find("->");
+	if (arrow == std::string::npos) {
+		// No header; whole string is the body
+		body_out = s;
+		return;
+	}
+
+	std::string head = s.substr(0, arrow);
+	std::string body = s.substr(arrow + 2);
+	StringUtil::Trim(head);
+	StringUtil::Trim(body);
+
+	if (head.size() < 2 || head.front() != '(' || head.back() != ')') {
+		throw BinderException("mygrad_ad_tf: lambda header must be '(...) -> body'");
+	}
+
+	std::string inside = head.substr(1, head.size() - 2);
+	StringUtil::Trim(inside);
+
+	param_names.clear();
+	if (!inside.empty()) {
+		auto parts = StringUtil::Split(inside, ',');
+		for (auto &p : parts) {
+			auto id = TrimCopy(p);
+			if (id.empty()) {
+				throw BinderException("mygrad_ad_tf: empty parameter name in lambda header");
+			}
+			param_names.push_back(ToLower(id));
+		}
+	}
+
+	if (body.empty()) {
+		throw BinderException("mygrad_ad_tf: lambda body is empty");
+	}
+	body_out = body;
+}
+
+// ===========================================================================
+// Tokenizer for tiny expression grammar
+// ===========================================================================
+enum class TokType { END, IDENT, NUMBER, PLUS, MINUS, STAR, SLASH, LPAREN, RPAREN, COMMA };
+struct Token { TokType type; std::string text; double number; };
+
+struct Lexer {
+	const std::string &s; idx_t i = 0;
+	explicit Lexer(const std::string &str) : s(str) {}
+	static bool IsIdentStart(char c){ return std::isalpha((unsigned char)c) || c=='_'; }
+	static bool IsIdentChar (char c){ return std::isalnum((unsigned char)c) || c=='_'; }
+
+	Token Next() {
+		while (i < s.size() && std::isspace((unsigned char)s[i])) i++;
+		if (i >= s.size()) return {TokType::END,"",0.0};
+		char c = s[i];
+		if (c=='+'){ i++; return {TokType::PLUS, "+", 0.0}; }
+		if (c=='-'){ i++; return {TokType::MINUS,"-", 0.0}; }
+		if (c=='*'){ i++; return {TokType::STAR, "*", 0.0}; }
+		if (c=='/'){ i++; return {TokType::SLASH,"/", 0.0}; }
+		if (c=='('){ i++; return {TokType::LPAREN,"(",0.0}; }
+		if (c==')'){ i++; return {TokType::RPAREN,")",0.0}; }
+		if (c==','){ i++; return {TokType::COMMA, ",",0.0}; }
+
+		if (std::isdigit((unsigned char)c) || c=='.') {
+			idx_t start=i;
+			while (i<s.size() && std::isdigit((unsigned char)s[i])) i++;
+			if (i<s.size() && s[i]=='.'){ i++; while (i<s.size() && std::isdigit((unsigned char)s[i])) i++; }
+			if (i<s.size() && (s[i]=='e'||s[i]=='E')) {
+				idx_t j=i+1; if (j<s.size() && (s[j]=='+'||s[j]=='-')) j++;
+				bool expd=false; while (j<s.size() && std::isdigit((unsigned char)s[j])){ expd=true; j++; }
+				if (expd) i=j;
+			}
+			auto t = s.substr(start, i-start);
+			char *endp=nullptr; double val = std::strtod(t.c_str(), &endp);
+			return {TokType::NUMBER, t, val};
+		}
+		if (IsIdentStart(c)) {
+			idx_t start=i++; while (i<s.size() && IsIdentChar(s[i])) i++;
+			return {TokType::IDENT, s.substr(start, i-start), 0.0};
+		}
+		throw BinderException("mygrad_ad_tf: invalid character '%c' in expression", c);
+	}
+};
+
+// ===========================================================================
+// Dual numbers + AST
+// ===========================================================================
+struct Dual {
+	double v;
+	std::vector<double> g;
+	explicit Dual(idx_t p):v(0.0),g(p,0.0){}
+};
+
+struct Node {
+	virtual ~Node()=default;
+	virtual Dual eval(const std::vector<double>&, idx_t) const=0;
+};
+
+struct NConst : Node {
+	double c;
+	explicit NConst(double c_):c(c_){}
+	Dual eval(const std::vector<double>&, idx_t p) const override { Dual r(p); r.v=c; return r; }
+};
+
+struct NVar : Node {
+	int id; // 0..p-1
+	explicit NVar(int i):id(i){}
+	Dual eval(const std::vector<double> &x, idx_t p) const override { Dual r(p); r.v=x[id]; r.g[id]=1.0; return r; }
+};
+
+struct NUnaryMinus : Node {
+	std::unique_ptr<Node> c;
+	explicit NUnaryMinus(std::unique_ptr<Node> n):c(std::move(n)){}
+	Dual eval(const std::vector<double> &x, idx_t p) const override {
+		auto a=c->eval(x,p); a.v=-a.v; for(auto &gi:a.g) gi=-gi; return a;
+	}
+};
+
+struct NBin : Node {
+	std::unique_ptr<Node> L,R; char op; // '+','-','*','/','^'
+	NBin(std::unique_ptr<Node> l, char o, std::unique_ptr<Node> r):L(std::move(l)),R(std::move(r)),op(o){}
+	Dual eval(const std::vector<double> &x, idx_t p) const override {
+		auto a=L->eval(x,p), b=R->eval(x,p); Dual r(p);
+		switch(op){
+			case '+': r.v=a.v+b.v; for(idx_t i=0;i<p;i++) r.g[i]=a.g[i]+b.g[i]; return r;
+			case '-': r.v=a.v-b.v; for(idx_t i=0;i<p;i++) r.g[i]=a.g[i]-b.g[i]; return r;
+			case '*': r.v=a.v*b.v; for(idx_t i=0;i<p;i++) r.g[i]=a.g[i]*b.v + a.v*b.g[i]; return r;
+			case '/':
+				if (b.v==0.0) throw BinderException("mygrad_ad_tf: division by zero");
+				r.v=a.v/b.v; for(idx_t i=0;i<p;i++) r.g[i]=(a.g[i]*b.v - a.v*b.g[i])/(b.v*b.v); return r;
+			case '^': {
+				if (a.v<=0.0) throw BinderException("mygrad_ad_tf: pow base must be > 0 (got %g)", a.v);
+				double f=std::pow(a.v,b.v), ln_a=std::log(a.v);
+				r.v=f; for(idx_t i=0;i<p;i++) r.g[i]=f*( b.g[i]*ln_a + b.v*(a.g[i]/a.v) ); return r;
+			}
+			default: throw BinderException("mygrad_ad_tf: internal unknown op");
+		}
+	}
+};
+
+// ===========================================================================
+// Recursive-descent parser with symbol table
+// ===========================================================================
+struct Parser {
+	Lexer lex; Token cur;
+	const std::unordered_map<std::string,int> &sym; // name -> index
+
+	explicit Parser(const std::string&s, const std::unordered_map<std::string,int> &sym_):lex(s),sym(sym_){ cur=lex.Next(); }
+	void eat(TokType t){ if(cur.type!=t) throw BinderException("mygrad_ad_tf: syntax error near '%s'", cur.text.c_str()); cur=lex.Next(); }
+
+	std::unique_ptr<Node> expr(){ auto n=term(); while(cur.type==TokType::PLUS||cur.type==TokType::MINUS){ char o=(cur.type==TokType::PLUS?'+':'-'); eat(cur.type); auto r=term(); n=std::make_unique<NBin>(std::move(n),o,std::move(r)); } return n; }
+	std::unique_ptr<Node> term(){ auto n=power(); while(cur.type==TokType::STAR||cur.type==TokType::SLASH){ char o=(cur.type==TokType::STAR?'*':'/'); eat(cur.type); auto r=power(); n=std::make_unique<NBin>(std::move(n),o,std::move(r)); } return n; }
+	std::unique_ptr<Node> power(){
+		if (cur.type==TokType::IDENT && ToLower(cur.text)=="pow"){ eat(TokType::IDENT); eat(TokType::LPAREN); auto a=expr(); eat(TokType::COMMA); auto b=expr(); eat(TokType::RPAREN); return std::make_unique<NBin>(std::move(a),'^',std::move(b)); }
+		return unary();
+	}
+	std::unique_ptr<Node> unary(){ if(cur.type==TokType::MINUS){ eat(TokType::MINUS); auto c=unary(); return std::make_unique<NUnaryMinus>(std::move(c)); } return primary(); }
+	std::unique_ptr<Node> primary(){
+		switch(cur.type){
+			case TokType::NUMBER: { double v=cur.number; eat(TokType::NUMBER); return std::make_unique<NConst>(v); }
+			case TokType::IDENT: {
+				auto name=ToLower(cur.text); eat(TokType::IDENT);
+				auto it = sym.find(name);
+				if (it==sym.end()) {
+					throw BinderException("mygrad_ad_tf: unknown identifier '%s'", name.c_str());
+				}
+				return std::make_unique<NVar>(it->second);
+			}
+			case TokType::LPAREN: { eat(TokType::LPAREN); auto n=expr(); eat(TokType::RPAREN); return n; }
+			default: throw BinderException("mygrad_ad_tf: unexpected token '%s'", cur.text.c_str());
+		}
+	}
+};
+
+// ===========================================================================
+// TABLE FUNCTION: mygrad_ad_tf
+//   args: 1..N DOUBLEs, last arg VARCHAR (body or "(params)->body")
+//   returns: x1..xN, dx1..dxN, result
+// ===========================================================================
+struct MyBindDataTF : public FunctionData {
+	idx_t pcount = 0;
+	std::vector<double> x;
+	std::string expr_body;
+	std::vector<std::string> names; // parameter names (x1.. or from header)
+	std::unique_ptr<Node> ast;
 
 	unique_ptr<FunctionData> Copy() const override {
-		vector<unique_ptr<Expression>> cap_copies;
-		cap_copies.reserve(captures.size());
-		for (auto &c : captures) cap_copies.push_back(c->Copy());
-		return make_uniq<ADGradBindData>(input_types, body->Copy(), param_count, std::move(cap_copies), field_types);
+		auto res = make_uniq<MyBindDataTF>();
+		res->pcount   = pcount;
+		res->x        = x;
+		res->expr_body= expr_body;
+		res->names    = names;
+
+		std::unordered_map<std::string,int> sym;
+		for (idx_t i=0;i<pcount;i++) sym[names[i]] = int(i);
+		Parser p(expr_body, sym);
+		res->ast = p.expr();
+		return res;
+	}
+	bool Equals(const FunctionData &o) const override {
+		auto &b = o.Cast<const MyBindDataTF>();
+		return pcount==b.pcount && x==b.x && expr_body==b.expr_body && names==b.names;
+	}
+};
+
+static unique_ptr<FunctionData> MygradBindTF(ClientContext &, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names_out) {
+
+	const idx_t argc = input.inputs.size();
+	if (argc < 2) {
+		throw BinderException("mygrad_ad_tf expects at least 2 arguments: 1..N DOUBLEs, then expression string");
+	}
+
+	std::string expr_raw = StripQuotes(input.inputs.back().ToString());
+	idx_t p = argc - 1;
+
+	std::vector<double> x(p, 0.0);
+	for (idx_t i = 0; i < p; i++) x[i] = AsDouble(input.inputs[i]);
+
+	// Parse optional lambda header
+	std::vector<std::string> header_names;
+	std::string body;
+	ParseLambdaHeaderIfAny(expr_raw, header_names, body);
+
+	std::vector<std::string> param_names;
+	if (!header_names.empty()) {
+		if (header_names.size() != p) {
+			throw BinderException("mygrad_ad_tf: lambda header lists %llu parameters but %llu values were provided",
+			                      (unsigned long long)header_names.size(), (unsigned long long)p);
+		}
+		for (auto &nm : header_names) param_names.push_back(ToLower(nm));
+	} else {
+		param_names.reserve(p);
+		for (idx_t i=0;i<p;i++) param_names.push_back("x"+std::to_string(i+1));
+	}
+
+	// Build symbol table
+	std::unordered_map<std::string,int> sym;
+	for (idx_t i=0;i<p;i++) sym[param_names[i]] = int(i);
+	// legacy short names a,b,c (optional)
+	if (p >= 1) sym["a"] = 0;
+	if (p >= 2) sym["b"] = 1;
+	if (p >= 3) sym["c"] = 2;
+
+	Parser parser(body, sym);
+	auto ast = parser.expr();
+
+	// Output schema: x1..xN, dx1..dxN, result
+	return_types.clear(); names_out.clear();
+	for (idx_t i=0;i<p;i++) { return_types.push_back(LogicalType::DOUBLE); names_out.emplace_back(param_names[i]); }
+	for (idx_t i=0;i<p;i++) { return_types.push_back(LogicalType::DOUBLE); names_out.emplace_back("d"+param_names[i]); }
+	return_types.push_back(LogicalType::DOUBLE); names_out.emplace_back("result");
+
+	auto bind = make_uniq<MyBindDataTF>();
+	bind->pcount    = p;
+	bind->x         = std::move(x);
+	bind->expr_body = std::move(body);
+	bind->names     = std::move(param_names);
+	bind->ast       = std::move(ast);
+	return std::move(bind);
+}
+
+struct MyGlobalStateTF final : public GlobalTableFunctionState {
+	bool done = false;
+	idx_t MaxThreads() const override { return 1; }
+};
+static unique_ptr<GlobalTableFunctionState> MygradInitGlobalTF(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<MyGlobalStateTF>();
+}
+static unique_ptr<LocalTableFunctionState> MygradInitLocalTF(ExecutionContext &, TableFunctionInitInput &, GlobalTableFunctionState *) {
+	return nullptr;
+}
+
+static void MygradExecTF(ClientContext &, TableFunctionInput &tinput, DataChunk &output) {
+	auto &bind = tinput.bind_data->Cast<MyBindDataTF>();
+	auto &g    = tinput.global_state->Cast<MyGlobalStateTF>();
+	if (g.done) { output.SetCardinality(0); return; }
+	g.done = true;
+
+	auto res = bind.ast->eval(bind.x, bind.pcount);
+
+	for (idx_t c = 0; c < output.ColumnCount(); c++) {
+		output.data[c].SetVectorType(VectorType::FLAT_VECTOR);
+		FlatVector::Validity(output.data[c]).SetAllValid(1);
+	}
+
+	idx_t col = 0;
+	for (idx_t i = 0; i < bind.pcount; i++) {
+		auto *ptr = FlatVector::GetData<double>(output.data[col++]); ptr[0] = bind.x[i];
+	}
+	for (idx_t i = 0; i < bind.pcount; i++) {
+		auto *ptr = FlatVector::GetData<double>(output.data[col++]); ptr[0] = res.g[i];
+	}
+	{
+		auto *ptr = FlatVector::GetData<double>(output.data[col++]); ptr[0] = res.v;
+	}
+	output.SetCardinality(1);
+}
+
+void RegisterMyGradADTF(BuiltinFunctions &set) {
+	// Single vararg signature; binder checks shapes
+	TableFunction tf(
+		"mygrad_ad_tf",
+		{LogicalType::ANY},
+		MygradExecTF,
+		MygradBindTF,
+		MygradInitGlobalTF,
+		MygradInitLocalTF
+	);
+	tf.varargs = LogicalType::ANY;
+	set.AddFunction(tf);
+}
+
+// ===========================================================================
+// SCALAR FUNCTIONS with real SQL LAMBDA
+//   mygrad_eval(LIST<DOUBLE>, LAMBDA) -> DOUBLE
+//   mygrad_grad(LIST<DOUBLE>, LAMBDA) -> STRUCT(result DOUBLE, grad LIST<DOUBLE>)
+// ===========================================================================
+
+using ParamMap = std::unordered_map<std::string, int>;
+
+struct CompiledLambda {
+	std::vector<std::string> params;   // param names in order
+	std::string body_sql;              // normalized body
+	std::unique_ptr<Node> ast;         // compiled AST
+};
+
+static CompiledLambda CompileDuckDBLambda(const LambdaExpression &lam) {
+	CompiledLambda out;
+
+	// Parameters: in newer DuckDB, LambdaExpression::parameters is vector<string>
+	// If your version stores expressions, adapt: out.params.push_back(StringUtil::Lower(p->ToString()));
+	for (auto &pname : lam.parameters) {
+		out.params.push_back(StringUtil::Lower(pname));
+	}
+
+	// Body SQL as string
+	std::string body_sql = lam.expression->ToString();
+	body_sql = ToLower(TrimCopy(body_sql));
+
+	// Symbol table
+	ParamMap sym;
+	for (idx_t i = 0; i < out.params.size(); i++) sym[out.params[i]] = int(i);
+
+	// Parse to AST
+	Parser parser(body_sql, sym);
+	out.ast = parser.expr();
+	out.body_sql = std::move(body_sql);
+	return out;
+}
+
+// ---------- mygrad_eval ----------
+struct MyGradEvalBind : public FunctionData {
+	CompiledLambda cl;
+	unique_ptr<FunctionData> Copy() const override {
+		auto res = make_uniq<MyGradEvalBind>();
+		// Rebuild AST from stored body_sql/params
+		res->cl.params = cl.params;
+		res->cl.body_sql = cl.body_sql;
+		ParamMap sym;
+		for (idx_t i=0;i<res->cl.params.size();i++) sym[res->cl.params[i]] = int(i);
+		Parser p(res->cl.body_sql, sym);
+		res->cl.ast = p.expr();
+		return res;
 	}
 	bool Equals(const FunctionData &) const override { return false; }
 };
 
-// ==================== binder ====================
-static unique_ptr<FunctionData> ADGradBind(ClientContext &, ScalarFunction &bound_function,
-                                           vector<unique_ptr<Expression>> &args) {
-	if (args.empty() || args.back()->expression_class != ExpressionClass::BOUND_LAMBDA) {
-		throw BinderException("mygrad_ad: last argument must be a lambda, e.g. (a,b) -> a*a + a*b + b*b");
+static unique_ptr<FunctionData> MyGradEvalBindFunc(ClientContext &, ScalarFunction &func,
+                                                   vector<unique_ptr<Expression>> &arguments) {
+	if (arguments.size() != 2) {
+		throw BinderException("mygrad_eval expects (LIST<DOUBLE>, LAMBDA)");
 	}
-	auto &ble = args.back()->Cast<BoundLambdaExpression>();
-
-	const idx_t n_inputs = args.size() - 1;
-
-	vector<LogicalType> input_types;
-	input_types.reserve(n_inputs);
-	for (idx_t i = 0; i < n_inputs; i++) input_types.push_back(args[i]->return_type);
-
-	auto body = ble.lambda_expr->Copy();
-
-	// If your branch exposes ble.parameter_count, use it; otherwise fallback:
-	idx_t param_count = 2;
-	// param_count = ble.parameter_count;
-
-	vector<unique_ptr<Expression>> cap_copy;
-	cap_copy.reserve(ble.captures.size());
-	for (auto &c : ble.captures) cap_copy.push_back(c->Copy());
-
-	// Output struct schema: [a.., da.., result]
-	std::vector<std::pair<std::string, LogicalType>> children;
-	vector<LogicalType> ftypes;
-	children.reserve(param_count * 2 + 1);
-	ftypes.reserve(param_count * 2 + 1);
-
-	for (idx_t i = 0; i < param_count; i++) {
-		LogicalType t = (n_inputs == 0) ? LogicalType::SQLNULL
-		                                : (i < n_inputs ? input_types[i] : input_types.back());
-		children.emplace_back(AD_ParamName(i), t);
-		ftypes.push_back(t);
+	auto &t0 = arguments[0]->return_type;
+	if (t0.id() != LogicalTypeId::LIST || ListType::GetChildType(t0).id() != LogicalTypeId::DOUBLE) {
+		throw BinderException("mygrad_eval: first argument must be LIST<DOUBLE>");
 	}
-	for (idx_t i = 0; i < param_count; i++) {
-		children.emplace_back("d" + AD_ParamName(i), LogicalType::DOUBLE);
-		ftypes.push_back(LogicalType::DOUBLE);
+	if (arguments[1]->expression_class != ExpressionClass::LAMBDA) {
+		throw BinderException("mygrad_eval: second argument must be a LAMBDA");
 	}
-	children.emplace_back("result", body->return_type);
-	ftypes.push_back(body->return_type);
 
-	bound_function.return_type = LogicalType::STRUCT(std::move(children));
-	return make_uniq<ADGradBindData>(std::move(input_types), std::move(body), param_count, std::move(cap_copy), std::move(ftypes));
+	auto &lam = arguments[1]->Cast<LambdaExpression>();
+	auto bind = make_uniq<MyGradEvalBind>();
+	bind->cl = CompileDuckDBLambda(lam);
+
+	func.return_type = LogicalType::DOUBLE;
+	return std::move(bind);
 }
 
-// ==================== tiny evaluator over bound expressions ====================
-struct AD_EvalEnv {
-	DataChunk *lambda_chunk; // [params..., captures...]
-	idx_t pcount;
-	idx_t seed_k;
-	idx_t row;
-	double GetAsDouble(idx_t j) const { return AD_ValueToDouble(lambda_chunk->data[j].GetValue(row)); }
-};
+static void MyGradEvalExecFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &bind = state.bind_data->Cast<MyGradEvalBind>();
+	const idx_t n = args.size();
 
-static AD_Dual AD_EvalDual(const Expression &e, const AD_EvalEnv &env);
+	auto &list_vec = args.data[0];
 
-static inline AD_Dual AD_EvalChild(const BoundFunctionExpression &bf, const AD_EvalEnv &env, idx_t i) {
-	return AD_EvalDual(*bf.children[i], env);
-}
-static inline AD_Dual AD_EvalChild(const BoundOperatorExpression &bo, const AD_EvalEnv &env, idx_t i) {
-	return AD_EvalDual(*bo.children[i], env);
-}
-
-static AD_Dual AD_EvalDual(const Expression &e, const AD_EvalEnv &env) {
-	switch (e.expression_class) {
-	case ExpressionClass::BOUND_CONSTANT: {
-		auto &bc = e.Cast<BoundConstantExpression>();
-		return AD_Const(AD_ValueToDouble(bc.value));
-	}
-	case ExpressionClass::BOUND_REFERENCE: {
-		auto &br = e.Cast<BoundReferenceExpression>();
-		double x = env.GetAsDouble(br.index);
-		double d = (br.index < env.pcount && br.index == env.seed_k) ? 1.0 : 0.0;
-		return {x, d};
-	}
-	case ExpressionClass::BOUND_CAST: {
-		auto &bc = e.Cast<BoundCastExpression>();
-		return AD_EvalDual(*bc.child, env); // keep derivative through numeric casts
-	}
-	case ExpressionClass::BOUND_OPERATOR: {
-		auto &bo = e.Cast<BoundOperatorExpression>();
-		if (bo.children.size() == 1) { // unary +/- 
-			auto x = AD_EvalDual(*bo.children[0], env);
-			if (bo.type == ExpressionType::OPERATOR_MINUS) return AD_Sub(AD_Const(0.0), x);
-			return x; // unary plus
-		}
-		auto lhs = AD_EvalDual(*bo.children[0], env);
-		auto rhs = AD_EvalDual(*bo.children[1], env);
-		switch (bo.type) {
-		case ExpressionType::OPERATOR_ADD:      return AD_Add(lhs, rhs);
-		case ExpressionType::OPERATOR_SUBTRACT: return AD_Sub(lhs, rhs);
-		case ExpressionType::OPERATOR_MULTIPLY: return AD_Mul(lhs, rhs);
-		case ExpressionType::OPERATOR_DIVIDE:   return AD_Div(lhs, rhs);
-		case ExpressionType::OPERATOR_POWER:    return AD_Pow(lhs, rhs);
-		default:
-			throw NotImplementedException("mygrad_ad: unsupported operator");
-		}
-	}
-	case ExpressionClass::BOUND_FUNCTION: {
-		auto &bf = e.Cast<BoundFunctionExpression>();
-		string name = StringUtil::Lower(bf.function.name);
-		if (name == "add")        return AD_Add(AD_EvalChild(bf, env, 0), AD_EvalChild(bf, env, 1));
-		if (name == "subtract")   return AD_Sub(AD_EvalChild(bf, env, 0), AD_EvalChild(bf, env, 1));
-		if (name == "multiply")   return AD_Mul(AD_EvalChild(bf, env, 0), AD_EvalChild(bf, env, 1));
-		if (name == "divide")     return AD_Div(AD_EvalChild(bf, env, 0), AD_EvalChild(bf, env, 1));
-		if (name == "pow" || name == "power")
-			return AD_Pow(AD_EvalChild(bf, env, 0), AD_EvalChild(bf, env, 1));
-		if (name == "ln" || name == "log") {
-			if (bf.children.size() == 1) return AD_Log(AD_EvalChild(bf, env, 0));
-			return AD_LogBase(AD_EvalChild(bf, env, 0), AD_EvalChild(bf, env, 1));
-		}
-		if (name == "log10") return AD_LogBase(AD_EvalChild(bf, env, 0), AD_Const(10.0));
-		throw NotImplementedException("mygrad_ad: unsupported function in lambda: " + name);
-	}
-	default:
-		throw NotImplementedException("mygrad_ad: unsupported expression class");
-	}
-}
-
-// ==================== execute ====================
-static void MyGradADExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto &bind = func_expr.bind_info->Cast<ADGradBindData>();
-
-	ClientContext &ctx = state.GetContext();
-	const idx_t nrows  = args.size();
-	const idx_t n_in   = args.ColumnCount();
-	const idx_t pcount = bind.param_count > 0 ? bind.param_count : 1;
-
-	// Build param chunk
-	vector<LogicalType> ptypes;
-	ptypes.reserve(pcount);
-	for (idx_t i = 0; i < pcount; i++) {
-		if (bind.input_types.empty()) {
-			ptypes.push_back(LogicalType::SQLNULL);
-		} else {
-			ptypes.push_back(i < bind.input_types.size() ? bind.input_types[i] : bind.input_types.back());
-		}
-	}
-	DataChunk param_chunk;
-	param_chunk.Initialize(Allocator::DefaultAllocator(), ptypes);
-	param_chunk.SetCardinality(nrows);
-	for (idx_t i = 0; i < pcount; i++) {
-		if (n_in == 0) {
-			param_chunk.data[i].SetVectorType(VectorType::CONSTANT_VECTOR);
-			param_chunk.data[i].Reference(Value());
-		} else {
-			const idx_t src = (i < n_in ? i : (n_in - 1));
-			if (args.data[src].GetType() == param_chunk.data[i].GetType()) {
-				param_chunk.data[i].Reference(args.data[src]);
-			} else {
-				VectorOperations::Cast(ctx, args.data[src], param_chunk.data[i], nrows, false);
-			}
-		}
-	}
-
-	// captures -> chunk
-	vector<LogicalType> cap_types;
-	cap_types.reserve(bind.captures.size());
-	for (auto &c : bind.captures) cap_types.push_back(c->return_type);
-
-	DataChunk captures_chunk;
-	if (!cap_types.empty()) {
-		captures_chunk.Initialize(Allocator::DefaultAllocator(), cap_types);
-		captures_chunk.SetCardinality(nrows);
-		for (idx_t i = 0; i < bind.captures.size(); i++) {
-			ExpressionExecutor cap_exec(ctx, *bind.captures[i]);
-			DataChunk cap_out;
-			cap_out.Initialize(Allocator::DefaultAllocator(), {bind.captures[i]->return_type});
-			cap_out.SetCardinality(nrows);
-			cap_exec.Execute(args, cap_out);
-			captures_chunk.data[i].Reference(cap_out.data[0]);
-		}
-	}
-
-	// lambda input = [params..., captures...]
-	vector<LogicalType> ltypes = ptypes;
-	for (auto &t : cap_types) ltypes.push_back(t);
-	DataChunk lambda_chunk;
-	lambda_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
-	lambda_chunk.SetCardinality(nrows);
-	for (idx_t i = 0; i < pcount; i++) lambda_chunk.data[i].Reference(param_chunk.data[i]);
-	for (idx_t i = 0; i < cap_types.size(); i++) lambda_chunk.data[pcount + i].Reference(captures_chunk.data[i]);
-
-	// base value using DuckDB executor
-	DataChunk f_base;
-	f_base.Initialize(Allocator::DefaultAllocator(), {bind.body->return_type});
-	f_base.SetCardinality(nrows);
-	{
-		ExpressionExecutor exec(ctx, *bind.body);
-		exec.Execute(lambda_chunk, f_base);
-	}
-
-	// output: [a.., da.., result]
-	const idx_t total_fields = pcount + pcount + 1;
-	DataChunk final_chunk;
-	final_chunk.Initialize(Allocator::DefaultAllocator(), bind.field_types);
-	final_chunk.SetCardinality(nrows);
-
-	for (idx_t i = 0; i < pcount; i++) final_chunk.data[i].Reference(param_chunk.data[i]);
-	for (idx_t k = 0; k < pcount; k++) {
-		final_chunk.data[pcount + k].SetVectorType(VectorType::FLAT_VECTOR);
-		FlatVector::Validity(final_chunk.data[pcount + k]).SetAllValid(nrows);
-	}
-
-	for (idx_t r = 0; r < nrows; r++) {
-		for (idx_t k = 0; k < pcount; k++) {
-			AD_EvalEnv env{&lambda_chunk, pcount, k, r};
-			AD_Dual out = AD_EvalDual(*bind.body, env);
-			auto *dst = FlatVector::GetData<double>(final_chunk.data[pcount + k]);
-			dst[r] = out.d;
-		}
-	}
-
-	final_chunk.data[pcount + pcount].Reference(f_base.data[0]);
-
-	// pack into STRUCT vector
-	auto &children = StructVector::GetEntries(result);
-	if (children.size() != total_fields) {
-		children.clear();
-		for (idx_t i = 0; i < total_fields; i++) {
-			children.push_back(make_uniq<Vector>(bind.field_types[i]));
-		}
-	}
-	for (idx_t i = 0; i < total_fields; i++) {
-		children[i]->Reference(final_chunk.data[i]);
-	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-}
+	auto *out = FlatVector::GetData<double>(result);
 
-// ==================== registration helpers ====================
-static void AD_AddOverload(ScalarFunctionSet &set, idx_t n_inputs) {
-	vector<LogicalType> types;
-	types.reserve(n_inputs + 1);
-	for (idx_t i = 0; i < n_inputs; i++) types.push_back(LogicalType::ANY);
-	types.push_back(LogicalType::LAMBDA);
+	UnifiedVectorFormat lvf;
+	list_vec.ToUnifiedFormat(n, lvf);
 
-	auto fun = ScalarFunction(types, LogicalType::ANY, MyGradADExecute, ADGradBind);
-	fun.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
-	set.AddFunction(fun);
-}
+	for (idx_t row = 0; row < n; row++) {
+		auto ridx = lvf.sel.get_index(row);
+		if (!lvf.validity.RowIsValid(ridx)) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		auto entry = ListVector::GetList(list_vec, ridx);
+		auto &child = ListVector::GetEntry(list_vec);
+		auto *cptr = FlatVector::GetData<double>(child);
 
-struct AutoDiffADFun {
-	static void RegisterFunction(BuiltinFunctions &set) {
-		ScalarFunctionSet fs("mygrad_ad");
-		AD_AddOverload(fs, 1);
-		AD_AddOverload(fs, 2);
-		AD_AddOverload(fs, 3);
-		set.AddFunction(fs);
+		if (entry.length != bind.cl.params.size()) {
+			throw BinderException("mygrad_eval: values list length (%llu) != lambda arity (%llu)",
+				(unsigned long long)entry.length, (unsigned long long)bind.cl.params.size());
+		}
+		std::vector<double> x(entry.length);
+		for (idx_t i=0;i<entry.length;i++) x[i] = cptr[entry.offset + i];
+
+		auto dual = bind.cl.ast->eval(x, x.size());
+		out[row] = dual.v;
 	}
+	result.SetCardinality(n);
+}
+
+// ---------- mygrad_grad ----------
+struct MyGradGradBind : public FunctionData {
+	CompiledLambda cl;
+	unique_ptr<FunctionData> Copy() const override {
+		auto res = make_uniq<MyGradGradBind>();
+		res->cl.params = cl.params;
+		res->cl.body_sql = cl.body_sql;
+		ParamMap sym;
+		for (idx_t i=0;i<res->cl.params.size();i++) sym[res->cl.params[i]] = int(i);
+		Parser p(res->cl.body_sql, sym);
+		res->cl.ast = p.expr();
+		return res;
+	}
+	bool Equals(const FunctionData &) const override { return false; }
 };
 
-// Public registrar expected by generic_functions.cpp
-void RegisterMyGradAD(BuiltinFunctions &set) {
-	AutoDiffADFun::RegisterFunction(set);
+static unique_ptr<FunctionData> MyGradGradBindFunc(ClientContext &, ScalarFunction &func,
+                                                   vector<unique_ptr<Expression>> &arguments) {
+	if (arguments.size() != 2) {
+		throw BinderException("mygrad_grad expects (LIST<DOUBLE>, LAMBDA)");
+	}
+	auto &t0 = arguments[0]->return_type;
+	if (t0.id() != LogicalTypeId::LIST || ListType::GetChildType(t0).id() != LogicalTypeId::DOUBLE) {
+		throw BinderException("mygrad_grad: first argument must be LIST<DOUBLE>");
+	}
+	if (arguments[1]->expression_class != ExpressionClass::LAMBDA) {
+		throw BinderException("mygrad_grad: second argument must be a LAMBDA");
+	}
+
+	auto &lam = arguments[1]->Cast<LambdaExpression>();
+	auto bind = make_uniq<MyGradGradBind>();
+	bind->cl = CompileDuckDBLambda(lam);
+
+	func.return_type = LogicalType::STRUCT({
+		{"result", LogicalType::DOUBLE},
+		{"grad",   LogicalType::LIST(LogicalType::DOUBLE)}
+	});
+	return std::move(bind);
+}
+
+static void MyGradGradExecFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &bind = state.bind_data->Cast<MyGradGradBind>();
+	const idx_t n = args.size();
+
+	// Prepare STRUCT children
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &children = StructVector::GetEntries(result);
+	D_ASSERT(children.size() == 2);
+	auto &res_vec  = *children[0];
+	auto &grad_vec = *children[1];
+
+	res_vec.SetVectorType(VectorType::FLAT_VECTOR);
+	grad_vec.SetVectorType(VectorType::FLAT_VECTOR);
+
+	auto *res_out = FlatVector::GetData<double>(res_vec);
+
+	auto &list_vec = args.data[0];
+	UnifiedVectorFormat lvf;
+	list_vec.ToUnifiedFormat(n, lvf);
+
+	// Child of grad list
+	auto &grad_child = ListVector::GetEntry(grad_vec);
+	idx_t running_offset = 0;
+
+	for (idx_t row = 0; row < n; row++) {
+		auto ridx = lvf.sel.get_index(row);
+		if (!lvf.validity.RowIsValid(ridx)) {
+			StructVector::SetNull(result, row, true);
+			continue;
+		}
+
+		auto entry = ListVector::GetList(list_vec, ridx);
+		auto &child = ListVector::GetEntry(list_vec);
+		auto *cptr = FlatVector::GetData<double>(child);
+
+		if (entry.length != bind.cl.params.size()) {
+			throw BinderException("mygrad_grad: values list length (%llu) != lambda arity (%llu)",
+				(unsigned long long)entry.length, (unsigned long long)bind.cl.params.size());
+		}
+
+		std::vector<double> x(entry.length);
+		for (idx_t i=0;i<entry.length;i++) x[i] = cptr[entry.offset + i];
+
+		auto dual = bind.cl.ast->eval(x, x.size());
+		res_out[row] = dual.v;
+
+		// write grad list slice
+		ListVector::Reserve(grad_vec, running_offset + dual.g.size());
+		ListVector::SetList(grad_vec, row, {running_offset, (idx_t)dual.g.size()});
+		auto *gptr = FlatVector::GetData<double>(grad_child);
+		for (idx_t i=0;i<dual.g.size();i++) gptr[running_offset + i] = dual.g[i];
+		running_offset += dual.g.size();
+	}
+
+	ListVector::SetListSize(grad_vec, running_offset);
+	result.SetCardinality(n);
+}
+
+// Registration
+void RegisterMyGradLambda(BuiltinFunctions &set) {
+	// mygrad_eval
+	{
+		ScalarFunction fun(
+			"mygrad_eval",
+			{LogicalType::LIST(LogicalType::DOUBLE), LogicalType::LAMBDA},
+			LogicalType::DOUBLE,
+			MyGradEvalExecFunc,
+			MyGradEvalBindFunc
+		);
+		set.AddFunction(fun);
+	}
+	// mygrad_grad
+	{
+		LogicalType ret = LogicalType::STRUCT({
+			{"result", LogicalType::DOUBLE},
+			{"grad",   LogicalType::LIST(LogicalType::DOUBLE)}
+		});
+		ScalarFunction fun(
+			"mygrad_grad",
+			{LogicalType::LIST(LogicalType::DOUBLE), LogicalType::LAMBDA},
+			ret,
+			MyGradGradExecFunc,
+			MyGradGradBindFunc
+		);
+		set.AddFunction(fun);
+	}
 }
 
 } // namespace duckdb
