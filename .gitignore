@@ -358,3 +358,17 @@ build_release/
 *.log
 *.csv
 *.png
+build*/
+build_debug*/
+*.duckdb
+*.duckdb_extension
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+*.log
+*.time
+/tmp/
+*.tmp
