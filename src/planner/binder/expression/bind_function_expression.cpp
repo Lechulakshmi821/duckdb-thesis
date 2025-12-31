@@ -145,58 +145,78 @@ BindResult ExpressionBinder::BindLambdaFunction(FunctionExpression &function, Sc
 	if (function.children.size() < 2) {
 		return BindResult("Invalid function arguments!");
 	}
-	D_ASSERT(function.children[function.children.size()-1]->GetExpressionClass() == ExpressionClass::LAMBDA);
 
-	// bind the list parameter
-	BindChild(function.children[0], depth, error);
-	if (!error.empty()) {
-		return BindResult(error);
+	// last child must be a lambda
+	auto &lambda_child = function.children.back();
+	if (lambda_child->expression_class != ExpressionClass::LAMBDA) {
+		return BindResult("Last argument must be a lambda expression");
 	}
 
-	// get the logical type of the children of the list
-	auto &list_child = BoundExpression::GetExpression(*function.children[0]);
-	LogicalType list_child_type = list_child->return_type.id();
-	if (list_child->return_type.id() != LogicalTypeId::SQLNULL &&
-	    list_child->return_type.id() != LogicalTypeId::UNKNOWN &&
-		list_child->return_type.id() == LogicalTypeId::LIST) {
-		list_child_type = ListType::GetChildType(list_child->return_type);
+	// ---------------------------------------------------------------------
+	// 1) Bind all NON-lambda arguments (everything except the last child)
+	// ---------------------------------------------------------------------
+	for (idx_t i = 0; i + 1 < function.children.size(); i++) {
+		BindChild(function.children[i], depth, error);
+		if (!error.empty()) {
+			return BindResult(error);
+		}
 	}
 
-	// bind the lambda parameter
-	auto &lambda_expr = function.children[function.children.size()-1]->Cast<LambdaExpression>();
-	BindResult bind_lambda_result = BindExpression(lambda_expr, depth, true, list_child_type);
+	// ---------------------------------------------------------------------
+	// 2) Determine the "element" type (from the first argument)
+	//    - for LIST arguments: use the child type
+	//    - otherwise: use the return type directly (e.g. DOUBLE)
+	// ---------------------------------------------------------------------
+	auto &first_child = BoundExpression::GetExpression(*function.children[0]);
+	LogicalType elem_type = first_child->return_type;
+
+	if (elem_type.id() != LogicalTypeId::SQLNULL &&
+	    elem_type.id() != LogicalTypeId::UNKNOWN &&
+	    elem_type.id() == LogicalTypeId::LIST) {
+		elem_type = ListType::GetChildType(elem_type);
+	}
+
+	// ---------------------------------------------------------------------
+	// 3) Bind the lambda expression with that element type
+	// ---------------------------------------------------------------------
+	auto &lambda_expr = lambda_child->Cast<LambdaExpression>();
+	BindResult bind_lambda_result = BindExpression(lambda_expr, depth, true, elem_type);
 
 	if (bind_lambda_result.HasError()) {
-		error = bind_lambda_result.error;
-	} else {
-		// successfully bound: replace the node with a BoundExpression
-		auto alias = function.children[function.children.size()-1]->alias;
-		bind_lambda_result.expression->alias = alias;
-		if (!alias.empty()) {
-			bind_lambda_result.expression->alias = alias;
-		}
-		function.children[function.children.size()-1] = make_uniq<BoundExpression>(std::move(bind_lambda_result.expression));
+		return BindResult(bind_lambda_result.error);
 	}
 
-	if (!error.empty()) {
-		return BindResult(error);
+	// preserve alias on the lambda, if any
+	auto alias = lambda_child->alias;
+	if (!alias.empty()) {
+		bind_lambda_result.expression->alias = alias;
 	}
+	// replace lambda child with a BoundExpression wrapper
+	lambda_child = make_uniq<BoundExpression>(std::move(bind_lambda_result.expression));
+
 	if (binder.GetBindingMode() == BindingMode::EXTRACT_NAMES) {
 		return BindResult(make_uniq<BoundConstantExpression>(Value(LogicalType::SQLNULL)));
 	}
 
-	// all children bound successfully
-	// extract the children and types
+	// ---------------------------------------------------------------------
+	// 4) Extract the bound children into a vector<Expression>
+	// ---------------------------------------------------------------------
 	vector<unique_ptr<Expression>> children;
+	children.reserve(function.children.size());
 	for (idx_t i = 0; i < function.children.size(); i++) {
 		auto &child = BoundExpression::GetExpression(*function.children[i]);
 		children.push_back(std::move(child));
 	}
 
-	// capture the (lambda) columns
+	// ---------------------------------------------------------------------
+	// 5) Capture columns for the lambda
+	// ---------------------------------------------------------------------
 	auto &bound_lambda_expr = children.back()->Cast<BoundLambdaExpression>();
-	CaptureLambdaColumns(bound_lambda_expr.captures, list_child_type, bound_lambda_expr.lambda_expr);
+	CaptureLambdaColumns(bound_lambda_expr.captures, elem_type, bound_lambda_expr.lambda_expr);
 
+	// ---------------------------------------------------------------------
+	// 6) Bind the scalar function with these children (incl. lambda)
+	// ---------------------------------------------------------------------
 	FunctionBinder function_binder(context);
 	unique_ptr<Expression> result =
 	    function_binder.BindScalarFunction(func, std::move(children), error, function.is_operator, &binder);
@@ -205,18 +225,20 @@ BindResult ExpressionBinder::BindLambdaFunction(FunctionExpression &function, Sc
 	}
 
 	auto &bound_function_expr = result->Cast<BoundFunctionExpression>();
-	D_ASSERT(bound_function_expr.children.size() == 2);
+	D_ASSERT(!bound_function_expr.children.empty());
 
-	// remove the lambda expression from the children
+	// ---------------------------------------------------------------------
+	// 7) Remove the lambda from the bound function's children (last child)
+	// ---------------------------------------------------------------------
 	auto lambda = std::move(bound_function_expr.children.back());
 	bound_function_expr.children.pop_back();
 	auto &bound_lambda = lambda->Cast<BoundLambdaExpression>();
 
-	// push back (in reverse order) any nested lambda parameters so that we can later use them in the lambda expression
-	// (rhs)
+	// ---------------------------------------------------------------------
+	// 8) Push bound references for nested lambda parameters (if any)
+	// ---------------------------------------------------------------------
 	if (lambda_bindings) {
 		for (idx_t i = lambda_bindings->size(); i > 0; i--) {
-
 			idx_t lambda_index = lambda_bindings->size() - i + 1;
 			auto &binding = (*lambda_bindings)[i - 1];
 
@@ -229,7 +251,9 @@ BindResult ExpressionBinder::BindLambdaFunction(FunctionExpression &function, Sc
 		}
 	}
 
-	// push back the captures into the children vector and the correct return types into the bound_function arguments
+	// ---------------------------------------------------------------------
+	// 9) Push captures into the children of the bound function
+	// ---------------------------------------------------------------------
 	for (auto &capture : bound_lambda.captures) {
 		bound_function_expr.children.push_back(std::move(capture));
 	}

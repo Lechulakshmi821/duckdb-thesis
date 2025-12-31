@@ -1,0 +1,29 @@
+PRAGMA threads=__T__;
+PRAGMA enable_progress_bar=false;
+
+DROP TABLE IF EXISTS data;
+CREATE TABLE data AS
+WITH base AS (
+  SELECT
+    random()::DOUBLE AS x1,
+    random()::DOUBLE AS x2,
+    random()::DOUBLE AS x3,
+    random()::DOUBLE AS x4,
+    random()::DOUBLE AS x5,
+    random()::DOUBLE AS x6
+  FROM range(__N__)
+)
+SELECT
+  x1,x2,x3,x4,x5,x6,
+  (0.5 + 0.4*x1)::DOUBLE                                              AS y1,
+  (0.5 + 0.4*x1 + 0.25*x2)::DOUBLE                                     AS y2,
+  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3)::DOUBLE                            AS y3,
+  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4)::DOUBLE                   AS y4,
+  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4 + 0.6*x5)::DOUBLE          AS y5,
+  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4 + 0.6*x5 + 0.7*x6)::DOUBLE AS y6
+FROM base;
+
+-- warmup
+SELECT COUNT(*) AS n FROM data;
+
+
