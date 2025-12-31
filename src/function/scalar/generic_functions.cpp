@@ -2,22 +2,16 @@
 
 namespace duckdb {
 
-void RegisterMyGradLambda(BuiltinFunctions &set);
-
-/*struct AutoDiffFun {
-    static void RegisterFunction(BuiltinFunctions &set);
-};*/
-/*struct AutoDiffGradFun {
-    static void RegisterFunction(BuiltinFunctions &set);
-};*/
+void RegisterAutoDiffGrad(BuiltinFunctions &set);
+//void RegisterAutoDiffGradReverse(BuiltinFunctions &set);
 
 void BuiltinFunctions::RegisterGenericFunctions() {
 	Register<ConstantOrNull>();
 	Register<ExportAggregateFunction>();
         //Register<AutoDiffFun>();
         //Register<AutoDiffGradFun>();
-        RegisterMyGradLambda(*this);
-       
+        RegisterAutoDiffGrad(*this);
+        //RegisterAutoDiffGradReverse(*this);
 }
 
 } // namespace duckdb
