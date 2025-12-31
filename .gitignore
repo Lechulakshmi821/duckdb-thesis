@@ -343,4 +343,18 @@ zig-cache/*
 extension/extension_config_local.cmake
 
 # extension_external dir
-extension_external
+extension_externalbuild*/ 
+build_debug/
+build_release/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.tmp
+*.time
+*.log
+*.csv
+*.png
