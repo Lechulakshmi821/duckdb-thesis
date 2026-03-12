@@ -138,10 +138,22 @@ static bool NameToSlot(const string &raw_in, idx_t param_cnt, idx_t &slot_out) {
 	StringUtil::Trim(s);
 	s = StringUtil::Lower(s);
 
+
+	// Special-case 4-arg lambdas: (w,b,x,y)
+    if (param_cnt == 4) {
+        if (s == "w") { slot_out = 0; return true; }
+        if (s == "b") { slot_out = 1; return true; }
+        if (s == "x") { slot_out = 2; return true; }
+        if (s == "y") { slot_out = 3; return true; }
+    }
+
 	
-	if (s == "u" || s == "x" || s == "a") { slot_out = 0; return slot_out < param_cnt; }
-	if (s == "v" || s == "y" || s == "b") { slot_out = 1; return slot_out < param_cnt; }
-	if (s == "w" || s == "z" || s == "c") { slot_out = 2; return slot_out < param_cnt; }
+	// Backward-compatible mapping for <= 3 params
+   if (param_cnt <= 3) {
+       if (s == "u" || s == "x" || s == "a") { slot_out = 0; return true; }
+       if (s == "v" || s == "y" || s == "b") { slot_out = 1; return true; }
+       if (s == "w" || s == "z" || s == "c") { slot_out = 2; return true; }
+    }
 
 	
 	idx_t pos = 0;
@@ -357,7 +369,7 @@ void RegisterAutoDiffGrad(BuiltinFunctions &set) {
 		Printer::Print("[mygrad] registering forward-mode AD function");
 	}
 
-	ScalarFunctionSet fset("mygrad"); 
+	ScalarFunctionSet fset("mygrad_fwd"); 
 	for (idx_t n = 1; n <= 32; n++) {
 		vector<LogicalType> args;
 		for (idx_t i = 0; i < n; i++) args.push_back(LogicalType::ANY);

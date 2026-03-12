@@ -3,15 +3,13 @@
 namespace duckdb {
 
 void RegisterAutoDiffGrad(BuiltinFunctions &set);
-//void RegisterAutoDiffGradReverse(BuiltinFunctions &set);
+void RegisterAutoDiffGradReverse(BuiltinFunctions &set);
 
 void BuiltinFunctions::RegisterGenericFunctions() {
-	Register<ConstantOrNull>();
-	Register<ExportAggregateFunction>();
-        //Register<AutoDiffFun>();
-        //Register<AutoDiffGradFun>();
-        RegisterAutoDiffGrad(*this);
-        //RegisterAutoDiffGradReverse(*this);
+        Register<ConstantOrNull>();
+        Register<ExportAggregateFunction>();
+        RegisterAutoDiffGrad(*this);          // forward -> mygrad_fwd
+        RegisterAutoDiffGradReverse(*this);   // reverse -> mygrad_rev
 }
 
 } // namespace duckdb
