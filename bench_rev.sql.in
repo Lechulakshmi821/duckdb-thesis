@@ -1,0 +1,89 @@
+PRAGMA threads=1;
+
+-- ============================================================
+-- Data: __N__ tuples (avoid alias+random() side-effect issue)
+-- ============================================================
+DROP TABLE IF EXISTS data;
+CREATE TABLE data AS
+WITH base AS (
+  SELECT
+    random()::DOUBLE AS x1,
+    random()::DOUBLE AS x2,
+    random()::DOUBLE AS x3,
+    random()::DOUBLE AS x4,
+    random()::DOUBLE AS x5,
+    random()::DOUBLE AS x6
+  FROM range(__N__)
+)
+SELECT
+  x1,x2,x3,x4,x5,x6,
+  (0.5 + 0.4*x1)::DOUBLE                                              AS y1,
+  (0.5 + 0.4*x1 + 0.25*x2)::DOUBLE                                     AS y2,
+  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3)::DOUBLE                            AS y3,
+  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4)::DOUBLE                   AS y4,
+  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4 + 0.6*x5)::DOUBLE          AS y5,
+  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4 + 0.6*x5 + 0.7*x6)::DOUBLE AS y6
+FROM base;
+
+-- optional warmup
+SELECT COUNT(*) AS n FROM data;
+
+-- ============================================================
+-- BASELINE: hand-derived GD (20 iterations)
+-- ============================================================
+WITH RECURSIVE gd(i,a1,a2,a3,a4,a5,a6,b) AS (
+  SELECT 1,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE
+  UNION ALL
+  SELECT i+1,
+    a1-0.1*AVG(2*x1*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
+    a2-0.1*AVG(2*x2*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
+    a3-0.1*AVG(2*x3*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
+    a4-0.1*AVG(2*x4*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
+    a5-0.1*AVG(2*x5*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
+    a6-0.1*AVG(2*x6*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
+    b -0.1*AVG(2*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6))
+  FROM gd, data
+  WHERE i < 20
+  GROUP BY i,a1,a2,a3,a4,a5,a6,b
+)
+SELECT 'baseline' AS method, * FROM gd WHERE i=20;
+
+-- ============================================================
+-- MYGRAD: forward-mode AD (20 iterations)
+--    Uses lambda params p1..p14 to avoid qualification issues
+-- ============================================================
+WITH RECURSIVE gd(i,a1,a2,a3,a4,a5,a6,b) AS (
+  SELECT 1,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE
+  UNION ALL
+  SELECT
+    s.i + 1,
+    s.a1 - 0.1*AVG(mg.g.d1),
+    s.a2 - 0.1*AVG(mg.g.d2),
+    s.a3 - 0.1*AVG(mg.g.d3),
+    s.a4 - 0.1*AVG(mg.g.d4),
+    s.a5 - 0.1*AVG(mg.g.d5),
+    s.a6 - 0.1*AVG(mg.g.d6),
+    s.b  - 0.1*AVG(mg.g.d7)
+  FROM (
+    SELECT
+      gd.i,
+      gd.a1 AS a1, gd.a2 AS a2, gd.a3 AS a3, gd.a4 AS a4, gd.a5 AS a5, gd.a6 AS a6, gd.b AS b,
+      gd.a1 AS w1, gd.a2 AS w2, gd.a3 AS w3, gd.a4 AS w4, gd.a5 AS w5, gd.a6 AS w6, gd.b AS wb,
+      d.x1  AS f1, d.x2  AS f2, d.x3  AS f3, d.x4  AS f4, d.x5  AS f5, d.x6  AS f6, d.y6 AS yy
+    FROM gd
+    CROSS JOIN data d
+    WHERE gd.i < 20
+  ) s
+  CROSS JOIN LATERAL (
+    SELECT mygrad_rev(
+      s.w1,s.w2,s.w3,s.w4,s.w5,s.w6,s.wb,
+      s.f1,s.f2,s.f3,s.f4,s.f5,s.f6,s.yy,
+      (p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14) ->
+        (p1*p8 + p2*p9 + p3*p10 + p4*p11 + p5*p12 + p6*p13 + p7 - p14)
+        *
+        (p1*p8 + p2*p9 + p3*p10 + p4*p11 + p5*p12 + p6*p13 + p7 - p14)
+    ) AS g
+  ) mg
+  GROUP BY s.i, s.a1, s.a2, s.a3, s.a4, s.a5, s.a6, s.b
+)
+SELECT 'mygrad' AS method, * FROM gd WHERE i=20;
