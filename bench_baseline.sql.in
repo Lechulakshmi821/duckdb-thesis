@@ -1,5 +1,11 @@
 PRAGMA threads=1;
 
+-- ============================================================
+-- BASELINE benchmark: handwritten SQL gradients only
+-- Dataset: __N__ tuples
+-- This file builds the data and runs ONLY the baseline GD loop.
+-- ============================================================
+
 DROP TABLE IF EXISTS data;
 CREATE TABLE data AS
 WITH base AS (
@@ -13,17 +19,18 @@ WITH base AS (
   FROM range(__N__)
 )
 SELECT
-  x1,x2,x3,x4,x5,x6,
-  (0.5 + 0.4*x1)::DOUBLE                                              AS y1,
-  (0.5 + 0.4*x1 + 0.25*x2)::DOUBLE                                     AS y2,
-  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3)::DOUBLE                            AS y3,
-  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4)::DOUBLE                   AS y4,
-  (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4 + 0.6*x5)::DOUBLE          AS y5,
+  x1, x2, x3, x4, x5, x6,
   (0.5 + 0.4*x1 + 0.25*x2 + 0.1*x3 + 0.2*x4 + 0.6*x5 + 0.7*x6)::DOUBLE AS y6
 FROM base;
 
+-- ------------------------------------------------------------
+-- Handwritten gradient descent (20 iterations)
+-- Each weight is updated with its pre-derived analytical gradient.
+-- ------------------------------------------------------------
 WITH RECURSIVE gd(i,a1,a2,a3,a4,a5,a6,b) AS (
-  SELECT 1,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE
+  SELECT 1,
+         1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,
+         1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE
   UNION ALL
   SELECT i+1,
     a1-0.1*AVG(2*x1*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
@@ -32,9 +39,9 @@ WITH RECURSIVE gd(i,a1,a2,a3,a4,a5,a6,b) AS (
     a4-0.1*AVG(2*x4*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
     a5-0.1*AVG(2*x5*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
     a6-0.1*AVG(2*x6*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
-    b -0.1*AVG(2*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6))
+    b -0.1*AVG(2*   (a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6))
   FROM gd, data
   WHERE i < 20
   GROUP BY i,a1,a2,a3,a4,a5,a6,b
 )
-SELECT * FROM gd WHERE i=20;
+SELECT 'baseline' AS method, * FROM gd WHERE i=20;
