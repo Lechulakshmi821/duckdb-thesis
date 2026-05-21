@@ -18,11 +18,16 @@
 
 #include <cctype>
 #include <vector>
+#include <unordered_map>
 
 namespace duckdb {
 
 
 static constexpr bool MYGRAD_DEBUG = false;
+static constexpr idx_t MYGRAD_MAX_PARAMS = 32;
+
+// Operator kinds resolved at bind time, used by EvalExpr at execution time.
+enum class OpKind { ADD, SUB, MUL, DIV, NEG, UNKNOWN };
 
 // ============================================================================
 // Bind data: store the lambda expression + how many lambda parameters it has
@@ -30,6 +35,7 @@ static constexpr bool MYGRAD_DEBUG = false;
 struct AutoDiffGradBindData : public FunctionData {
 	unique_ptr<Expression> lambda_expr;
 	idx_t param_cnt;
+	std::unordered_map<Expression*, OpKind> op_cache;
 
 	AutoDiffGradBindData(unique_ptr<Expression> expr_p, idx_t nparams_p)
 	    : lambda_expr(std::move(expr_p)), param_cnt(nparams_p) {
@@ -49,22 +55,26 @@ struct AutoDiffGradBindData : public FunctionData {
 // ============================================================================
 struct Dual {
 	double val;
-	vector<double> grad;
+	idx_t n;
+	double grad[MYGRAD_MAX_PARAMS];
 };
 
 static Dual MakeConst(double v, idx_t n) {
 	Dual d;
 	d.val = v;
-	d.grad.assign(n, 0.0);
+	d.n = n;
+	for (idx_t i = 0; i < n; i++) {
+		d.grad[i] = 0.0;
+	}
 	return d;
 }
 
 static Dual Add(const Dual &a, const Dual &b) {
 	Dual o;
 	o.val = a.val + b.val;
-	o.grad = a.grad;
-	for (idx_t i = 0; i < o.grad.size(); i++) {
-		o.grad[i] += b.grad[i];
+	o.n = a.n;
+	for (idx_t i = 0; i < a.n; i++) {
+		o.grad[i] = a.grad[i] + b.grad[i];
 	}
 	return o;
 }
@@ -72,9 +82,9 @@ static Dual Add(const Dual &a, const Dual &b) {
 static Dual Sub(const Dual &a, const Dual &b) {
 	Dual o;
 	o.val = a.val - b.val;
-	o.grad = a.grad;
-	for (idx_t i = 0; i < o.grad.size(); i++) {
-		o.grad[i] -= b.grad[i];
+	o.n = a.n;
+	for (idx_t i = 0; i < a.n; i++) {
+		o.grad[i] = a.grad[i] - b.grad[i];
 	}
 	return o;
 }
@@ -82,8 +92,8 @@ static Dual Sub(const Dual &a, const Dual &b) {
 static Dual Mul(const Dual &a, const Dual &b) {
 	Dual o;
 	o.val = a.val * b.val;
-	o.grad.assign(a.grad.size(), 0.0);
-	for (idx_t i = 0; i < o.grad.size(); i++) {
+	o.n = a.n;
+	for (idx_t i = 0; i < a.n; i++) {
 		o.grad[i] = a.grad[i] * b.val + b.grad[i] * a.val;
 	}
 	return o;
@@ -92,12 +102,12 @@ static Dual Mul(const Dual &a, const Dual &b) {
 static Dual Div(const Dual &a, const Dual &b) {
 	Dual o;
 	o.val = a.val / b.val;
-	o.grad.assign(a.grad.size(), 0.0);
+	o.n = a.n;
 
 	const double inv = 1.0 / b.val;
 	const double inv2 = inv * inv;
 
-	for (idx_t i = 0; i < o.grad.size(); i++) {
+	for (idx_t i = 0; i < a.n; i++) {
 		o.grad[i] = (a.grad[i] * b.val - b.grad[i] * a.val) * inv2;
 	}
 	return o;
@@ -106,9 +116,9 @@ static Dual Div(const Dual &a, const Dual &b) {
 static Dual Neg(const Dual &a) {
 	Dual o;
 	o.val = -a.val;
-	o.grad = a.grad;
-	for (idx_t i = 0; i < o.grad.size(); i++) {
-		o.grad[i] = -o.grad[i];
+	o.n = a.n;
+	for (idx_t i = 0; i < a.n; i++) {
+		o.grad[i] = -a.grad[i];
 	}
 	return o;
 }
@@ -180,6 +190,58 @@ static bool NameToSlot(const string &raw_in, idx_t param_cnt, idx_t &slot_out) {
 }
 
 // ============================================================================
+// Resolve operator kind from an expression (called at bind time only)
+// ============================================================================
+static OpKind ResolveOp(Expression &expr) {
+	if (expr.expression_class == ExpressionClass::BOUND_OPERATOR) {
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		string t = StringUtil::Lower(ExpressionTypeToString(op.type));
+		idx_t nch = op.children.size();
+		if (nch == 1 && (t.find("neg") != string::npos || t.find("unary") != string::npos || t == "-")) return OpKind::NEG;
+		if (nch == 2) {
+			if (t.find("add") != string::npos || t.find("plus") != string::npos) return OpKind::ADD;
+			if (t.find("sub") != string::npos || t.find("minus") != string::npos) return OpKind::SUB;
+			if (t.find("mul") != string::npos) return OpKind::MUL;
+			if (t.find("div") != string::npos) return OpKind::DIV;
+		}
+	}
+	if (expr.expression_class == ExpressionClass::BOUND_FUNCTION) {
+		auto &fn = expr.Cast<BoundFunctionExpression>();
+		string name = StringUtil::Lower(fn.function.name);
+		idx_t nch = fn.children.size();
+		if (nch == 1 && (name.find("neg") != string::npos || name == "-")) return OpKind::NEG;
+		if (nch == 2) {
+			if (name == "+" || name.find("add") != string::npos || name.find("plus") != string::npos) return OpKind::ADD;
+			if (name == "-" || name.find("sub") != string::npos || name.find("minus") != string::npos) return OpKind::SUB;
+			if (name == "*" || name.find("mul") != string::npos) return OpKind::MUL;
+			if (name == "/" || name.find("div") != string::npos) return OpKind::DIV;
+		}
+	}
+	return OpKind::UNKNOWN;
+}
+
+// ============================================================================
+// Walk expression tree once at bind time and fill the operator cache
+// ============================================================================
+static void PrecomputeOps(Expression &expr, std::unordered_map<Expression*, OpKind> &cache) {
+	if (expr.expression_class == ExpressionClass::BOUND_OPERATOR ||
+	    expr.expression_class == ExpressionClass::BOUND_FUNCTION) {
+		cache[&expr] = ResolveOp(expr);
+	}
+
+	if (expr.expression_class == ExpressionClass::BOUND_OPERATOR) {
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		for (auto &c : op.children) PrecomputeOps(*c, cache);
+	} else if (expr.expression_class == ExpressionClass::BOUND_FUNCTION) {
+		auto &fn = expr.Cast<BoundFunctionExpression>();
+		for (auto &c : fn.children) PrecomputeOps(*c, cache);
+	} else if (expr.expression_class == ExpressionClass::BOUND_CAST) {
+		auto &c = expr.Cast<BoundCastExpression>();
+		PrecomputeOps(*c.child, cache);
+	}
+}
+
+// ============================================================================
 // Evaluate expression with forward mode AD
 // Supported: constants, refs, casts, + - * /, unary minus
 // ============================================================================
@@ -228,10 +290,11 @@ static Dual EvalExpr(Expression &expr, const RowInput &in, idx_t row, const Auto
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
 		auto &ch = op.children;
-		string t = StringUtil::Lower(ExpressionTypeToString(op.type));
 
-		// unary minus
-		if (ch.size() == 1 && (t.find("neg") != string::npos || t.find("unary") != string::npos || t == "-")) {
+		auto it = bind.op_cache.find(&expr);
+		OpKind kind = (it != bind.op_cache.end()) ? it->second : OpKind::UNKNOWN;
+
+		if (kind == OpKind::NEG) {
 			return Neg(EvalExpr(*ch[0], in, row, bind));
 		}
 
@@ -242,21 +305,23 @@ static Dual EvalExpr(Expression &expr, const RowInput &in, idx_t row, const Auto
 		auto L = EvalExpr(*ch[0], in, row, bind);
 		auto R = EvalExpr(*ch[1], in, row, bind);
 
-		if (t.find("add") != string::npos || t.find("plus") != string::npos) return Add(L, R);
-		if (t.find("sub") != string::npos || t.find("minus") != string::npos) return Sub(L, R);
-		if (t.find("mul") != string::npos) return Mul(L, R);
-		if (t.find("div") != string::npos) return Div(L, R);
-
-		throw BinderException("mygrad: unsupported operator (use +,-,*,/)");
+		switch (kind) {
+		case OpKind::ADD: return Add(L, R);
+		case OpKind::SUB: return Sub(L, R);
+		case OpKind::MUL: return Mul(L, R);
+		case OpKind::DIV: return Div(L, R);
+		default: throw BinderException("mygrad: unsupported operator (use +,-,*,/)");
+		}
 	}
 
 	case ExpressionClass::BOUND_FUNCTION: {
-		
 		auto &fn = expr.Cast<BoundFunctionExpression>();
 		auto &ch = fn.children;
-		string name = StringUtil::Lower(fn.function.name);
 
-		if (ch.size() == 1 && (name.find("neg") != string::npos || name == "-")) {
+		auto it = bind.op_cache.find(&expr);
+		OpKind kind = (it != bind.op_cache.end()) ? it->second : OpKind::UNKNOWN;
+
+		if (kind == OpKind::NEG && ch.size() == 1) {
 			return Neg(EvalExpr(*ch[0], in, row, bind));
 		}
 
@@ -264,10 +329,13 @@ static Dual EvalExpr(Expression &expr, const RowInput &in, idx_t row, const Auto
 			auto L = EvalExpr(*ch[0], in, row, bind);
 			auto R = EvalExpr(*ch[1], in, row, bind);
 
-			if (name == "+" || name.find("add") != string::npos || name.find("plus") != string::npos) return Add(L, R);
-			if (name == "-" || name.find("sub") != string::npos || name.find("minus") != string::npos) return Sub(L, R);
-			if (name == "*" || name.find("mul") != string::npos) return Mul(L, R);
-			if (name == "/" || name.find("div") != string::npos) return Div(L, R);
+			switch (kind) {
+			case OpKind::ADD: return Add(L, R);
+			case OpKind::SUB: return Sub(L, R);
+			case OpKind::MUL: return Mul(L, R);
+			case OpKind::DIV: return Div(L, R);
+			default: break;
+			}
 		}
 
 		throw BinderException("mygrad: unsupported function in forward AD");
@@ -288,6 +356,11 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 	}
 
 	idx_t n_numeric_args = arguments.size() - 1;
+
+	if (n_numeric_args > MYGRAD_MAX_PARAMS) {
+		throw BinderException("mygrad: too many parameters (max is 32)");
+	}
+
 
 	
 	child_list_t<LogicalType> kids;
@@ -325,7 +398,9 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 		}
 	}
 
-	return make_uniq<AutoDiffGradBindData>(std::move(lambda_expr), n_params);
+	auto bind_data = make_uniq<AutoDiffGradBindData>(std::move(lambda_expr), n_params);
+	PrecomputeOps(*bind_data->lambda_expr, bind_data->op_cache);
+	return std::move(bind_data);
 }
 
 // ============================================================================

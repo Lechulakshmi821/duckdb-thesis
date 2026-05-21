@@ -372,3 +372,10 @@ build_debug*/
 *.time
 /tmp/
 *.tmp
+
+# Personal local files (added during forward-mode AD optimization work)
+*.bak
+*.bak2
+*.optimized
+*.optimized2
+build_log*.txt
