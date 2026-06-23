@@ -24,6 +24,11 @@
 
 namespace duckdb {
 
+// Tile size for vectorized reverse-mode tape replay.
+// Chosen so that the per-tile working set (TILE_SIZE * prog.size() doubles
+// for each of vals and adj) fits in L2 cache.
+static constexpr idx_t MYGRAD_REV_TILE_SIZE = 256;
+
 //------------------------------------------------------------------------------
 // RowInput
 //------------------------------------------------------------------------------
@@ -332,82 +337,113 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 	const auto &prog = bind.prog;
 	const int32_t root = bind.root;
 
-	// reuse buffers per chunk
-	std::vector<double> vals(prog.size());
-	std::vector<double> adj(prog.size());
+	// Tiled vectorized tape replay.
+	// Working buffers are sized per tile so they fit in L2 cache.
+	// Within each tile, the per-row loop runs the original forward/backward
+	// passes; only the indexing is local to the tile.
+	const idx_t TILE = MYGRAD_REV_TILE_SIZE;
+	std::vector<double> vals(prog.size() * TILE);
+	std::vector<double> adj(prog.size() * TILE);
 
-	for (idx_t r = 0; r < count; r++) {
-		// forward pass
+	for (idx_t tile_start = 0; tile_start < count; tile_start += TILE) {
+		const idx_t tile_count = std::min(TILE, count - tile_start);
+
+		// Phase A: forward pass - for each operation, process all rows in this tile
 		for (idx_t i = 0; i < prog.size(); i++) {
 			const auto &op = prog[i];
 			switch (op.op) {
-			case OpKind::INPUT: vals[i] = in.Get((idx_t)op.input_slot, r); break;
-			case OpKind::CONST: vals[i] = op.cval; break;
-			case OpKind::NEG:   vals[i] = -vals[(idx_t)op.a]; break;
-			case OpKind::ADD:   vals[i] = vals[(idx_t)op.a] + vals[(idx_t)op.b]; break;
-			case OpKind::SUB:   vals[i] = vals[(idx_t)op.a] - vals[(idx_t)op.b]; break;
-			case OpKind::MUL:   vals[i] = vals[(idx_t)op.a] * vals[(idx_t)op.b]; break;
-			case OpKind::DIV:   vals[i] = vals[(idx_t)op.a] / vals[(idx_t)op.b]; break;
-			default:            vals[i] = 0.0; break;
+			case OpKind::INPUT:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = in.Get((idx_t)op.input_slot, tile_start + r);
+				break;
+			case OpKind::CONST:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = op.cval;
+				break;
+			case OpKind::NEG:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = -vals[(idx_t)op.a * TILE + r];
+				break;
+			case OpKind::ADD:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = vals[(idx_t)op.a * TILE + r] + vals[(idx_t)op.b * TILE + r];
+				break;
+			case OpKind::SUB:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = vals[(idx_t)op.a * TILE + r] - vals[(idx_t)op.b * TILE + r];
+				break;
+			case OpKind::MUL:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = vals[(idx_t)op.a * TILE + r] * vals[(idx_t)op.b * TILE + r];
+				break;
+			case OpKind::DIV:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = vals[(idx_t)op.a * TILE + r] / vals[(idx_t)op.b * TILE + r];
+				break;
+			default:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = 0.0;
+				break;
 			}
 		}
 
-		std::fill(adj.begin(), adj.end(), 0.0);
-		if (root >= 0) adj[(idx_t)root] = 1.0;
+		// Phase B: zero adjoints for this tile, seed root for every row in tile
+		for (idx_t i = 0; i < prog.size(); i++) {
+			for (idx_t r = 0; r < tile_count; r++) adj[i * TILE + r] = 0.0;
+		}
+		if (root >= 0) {
+			for (idx_t r = 0; r < tile_count; r++) adj[(idx_t)root * TILE + r] = 1.0;
+		}
 
-		// backward pass
+		// Phase C: backward pass - for each operation in reverse, process all rows in tile
 		for (idx_t ii = prog.size(); ii > 0; ii--) {
 			const idx_t i = ii - 1;
 			const auto &op = prog[i];
-			const double a = adj[i];
-
 			switch (op.op) {
 			case OpKind::INPUT:
 			case OpKind::CONST:
 				break;
-
 			case OpKind::NEG:
-				adj[(idx_t)op.a] += a * (-1.0);
+				for (idx_t r = 0; r < tile_count; r++) adj[(idx_t)op.a * TILE + r] += adj[i * TILE + r] * (-1.0);
 				break;
-
 			case OpKind::ADD:
-				adj[(idx_t)op.a] += a;
-				adj[(idx_t)op.b] += a;
+				for (idx_t r = 0; r < tile_count; r++) {
+					const double a = adj[i * TILE + r];
+					adj[(idx_t)op.a * TILE + r] += a;
+					adj[(idx_t)op.b * TILE + r] += a;
+				}
 				break;
-
 			case OpKind::SUB:
-				adj[(idx_t)op.a] += a;
-				adj[(idx_t)op.b] += a * (-1.0);
+				for (idx_t r = 0; r < tile_count; r++) {
+					const double a = adj[i * TILE + r];
+					adj[(idx_t)op.a * TILE + r] += a;
+					adj[(idx_t)op.b * TILE + r] += a * (-1.0);
+				}
 				break;
-
-			case OpKind::MUL: {
-				const double lv = vals[(idx_t)op.a];
-				const double rv = vals[(idx_t)op.b];
-				adj[(idx_t)op.a] += a * rv;
-				adj[(idx_t)op.b] += a * lv;
+			case OpKind::MUL:
+				for (idx_t r = 0; r < tile_count; r++) {
+					const double a = adj[i * TILE + r];
+					const double lv = vals[(idx_t)op.a * TILE + r];
+					const double rv = vals[(idx_t)op.b * TILE + r];
+					adj[(idx_t)op.a * TILE + r] += a * rv;
+					adj[(idx_t)op.b * TILE + r] += a * lv;
+				}
 				break;
-			}
-
-			case OpKind::DIV: {
-				const double lv = vals[(idx_t)op.a];
-				const double rv = vals[(idx_t)op.b];
-				const double inv = 1.0 / rv;
-				adj[(idx_t)op.a] += a * inv;
-				adj[(idx_t)op.b] += a * (-lv) * inv * inv;
+			case OpKind::DIV:
+				for (idx_t r = 0; r < tile_count; r++) {
+					const double a = adj[i * TILE + r];
+					const double lv = vals[(idx_t)op.a * TILE + r];
+					const double rv = vals[(idx_t)op.b * TILE + r];
+					const double inv = 1.0 / rv;
+					adj[(idx_t)op.a * TILE + r] += a * inv;
+					adj[(idx_t)op.b * TILE + r] += a * (-lv) * inv * inv;
+				}
 				break;
-			}
-
 			default:
 				break;
 			}
 		}
 
-		// emit gradients for each input slot
+		// Phase D: emit gradients for all rows in tile
 		for (idx_t j = 0; j < N; j++) {
-			double g = 0.0;
 			const int32_t node = bind.input_node[j];
-			if (node >= 0) g = adj[(idx_t)node];
-			child_ptrs[j][r] = g;
+			if (node >= 0) {
+				for (idx_t r = 0; r < tile_count; r++) child_ptrs[j][tile_start + r] = adj[(idx_t)node * TILE + r];
+			} else {
+				for (idx_t r = 0; r < tile_count; r++) child_ptrs[j][tile_start + r] = 0.0;
+			}
 		}
 	}
 }
