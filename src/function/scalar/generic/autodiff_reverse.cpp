@@ -17,6 +17,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <limits>
@@ -94,7 +95,7 @@ static inline bool NameToSlot(const string &raw_in, idx_t param_cnt, idx_t &slot
 //------------------------------------------------------------------------------
 // Compiled reverse-mode "bytecode"
 //------------------------------------------------------------------------------
-enum class OpKind : uint8_t { INPUT, CONST, ADD, SUB, MUL, DIV, NEG };
+enum class OpKind : uint8_t { INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW };
 
 struct CompiledOp {
 	OpKind op;
@@ -177,7 +178,8 @@ static int32_t CompileExpr(Expression &expr,
                            idx_t param_cnt,
                            std::vector<CompiledOp> &prog,
                            std::vector<int32_t> &input_cache,
-                           std::vector<int32_t> &input_node_out) {
+                           std::vector<int32_t> &input_node_out,
+                           const vector<unique_ptr<Expression>> &captures) {
 	switch (expr.expression_class) {
 	case ExpressionClass::BOUND_CONSTANT: {
 		auto &c = expr.Cast<BoundConstantExpression>();
@@ -197,7 +199,17 @@ static int32_t CompileExpr(Expression &expr,
 	case ExpressionClass::BOUND_REF: {
 		string nm = expr.alias;
 		if (nm.empty()) nm = expr.ToString();
-
+		// Handle capture references like #0, #1, #2 etc.
+		if (!nm.empty() && nm[0] == '#') {
+			// DuckDB #N index is offset by param count; scan all captures for constants
+			for (idx_t ci = 0; ci < captures.size(); ci++) {
+				if (captures[ci]->expression_class == ExpressionClass::BOUND_CONSTANT) {
+					auto &cc = captures[ci]->Cast<BoundConstantExpression>();
+					return EmitConst(prog, cc.value.GetValue<double>());
+				}
+			}
+			return EmitConst(prog, 0.0);
+		}
 		idx_t slot;
 		if (!NameToSlot(nm, param_cnt, slot)) {
 			return EmitConst(prog, 0.0);
@@ -210,7 +222,7 @@ static int32_t CompileExpr(Expression &expr,
 	}
 	case ExpressionClass::BOUND_CAST: {
 		auto &c = expr.Cast<BoundCastExpression>();
-		return CompileExpr(*c.child, param_cnt, prog, input_cache, input_node_out);
+		return CompileExpr(*c.child, param_cnt, prog, input_cache, input_node_out, captures);
 	}
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
@@ -218,15 +230,15 @@ static int32_t CompileExpr(Expression &expr,
 		const string t = StringUtil::Lower(ExpressionTypeToString(op.type));
 
 		if (ch.size() == 1 && (t.find("neg") != string::npos || t.find("unary") != string::npos || t == "-")) {
-			auto a = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out);
+			auto a = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out, captures);
 			return EmitNeg(prog, a);
 		}
 		if (ch.size() != 2) {
 			throw BinderException("mygrad_rev: only unary minus and binary +,-,*,/ supported");
 		}
 
-		auto L = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out);
-		auto R = CompileExpr(*ch[1], param_cnt, prog, input_cache, input_node_out);
+		auto L = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out, captures);
+		auto R = CompileExpr(*ch[1], param_cnt, prog, input_cache, input_node_out, captures);
 
 		if (t.find("add") != string::npos || t.find("plus") != string::npos) return EmitBin(prog, OpKind::ADD, L, R);
 		if (t.find("sub") != string::npos || t.find("minus") != string::npos) return EmitBin(prog, OpKind::SUB, L, R);
@@ -241,22 +253,33 @@ static int32_t CompileExpr(Expression &expr,
 		const string name = StringUtil::Lower(fn.function.name);
 
 		if (ch.size() == 1 && (name.find("neg") != string::npos || name == "-")) {
-			auto a = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out);
+			auto a = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out, captures);
 			return EmitNeg(prog, a);
 		}
 		if (ch.size() == 2) {
-			auto L = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out);
-			auto R = CompileExpr(*ch[1], param_cnt, prog, input_cache, input_node_out);
+			auto L = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out, captures);
+			auto R = CompileExpr(*ch[1], param_cnt, prog, input_cache, input_node_out, captures);
 
 			if (name == "+" || name.find("add") != string::npos || name.find("plus") != string::npos) return EmitBin(prog, OpKind::ADD, L, R);
 			if (name == "-" || name.find("sub") != string::npos || name.find("minus") != string::npos) return EmitBin(prog, OpKind::SUB, L, R);
 			if (name == "*" || name.find("mul") != string::npos) return EmitBin(prog, OpKind::MUL, L, R);
 			if (name == "/" || name.find("div") != string::npos) return EmitBin(prog, OpKind::DIV, L, R);
+			if (name == "^" || name == "pow" || name.find("pow") != string::npos) return EmitBin(prog, OpKind::POW, L, R);
 		}
-		throw BinderException("mygrad_rev: unsupported function in compiler");
+		{ throw BinderException("mygrad_rev: unsupported function '" + name + "' (children=" + std::to_string(ch.size()) + ") in compiler"); }
 	}
-	default:
-		throw BinderException("mygrad_rev: unsupported expression type in compiler");
+	case ExpressionClass::BOUND_LAMBDA: {
+		// DuckDB routes captured constants through BOUND_LAMBDA
+		// Try to parse the string representation as a double
+		try {
+			double v = std::stod(expr.ToString());
+					return EmitConst(prog, v);
+		} catch (...) {}
+		return EmitConst(prog, 0.0);
+	}
+	default: {
+			return EmitConst(prog, 0.0);
+	}
 	}
 }
 
@@ -288,7 +311,11 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 
 	if (n_params == 0) throw BinderException("mygrad_rev: lambda must have at least 1 parameter");
 	if (n_params != n_numeric_args) throw BinderException("mygrad_rev: lambda parameter count must match #numeric args");
-	if (!ble.captures.empty()) throw BinderException("mygrad_rev: captures not supported");
+	for (auto &cap : ble.captures) {
+			if (cap->expression_class != ExpressionClass::BOUND_CONSTANT) {
+			throw BinderException("mygrad_rev: only constant captures supported, got class=" + std::to_string((int)cap->expression_class) + " str=" + cap->ToString());
+		}
+	}
 
 	auto lambda_expr = ble.lambda_expr->Copy();
 
@@ -305,7 +332,7 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 	std::fill(bind_data->input_node.begin(), bind_data->input_node.end(), -1);
 
 	std::vector<int32_t> input_cache(n_params, -1);
-	bind_data->root = CompileExpr(*bind_data->lambda_expr, n_params, bind_data->prog, input_cache, bind_data->input_node);
+	bind_data->root = CompileExpr(*bind_data->lambda_expr, n_params, bind_data->prog, input_cache, bind_data->input_node, ble.captures);
 
 	return std::move(bind_data);
 }
@@ -373,6 +400,9 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 			case OpKind::DIV:
 				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = vals[(idx_t)op.a * TILE + r] / vals[(idx_t)op.b * TILE + r];
 				break;
+			case OpKind::POW:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = std::pow(vals[(idx_t)op.a * TILE + r], vals[(idx_t)op.b * TILE + r]);
+				break;
 			default:
 				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = 0.0;
 				break;
@@ -429,6 +459,15 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 					const double inv = 1.0 / rv;
 					adj[(idx_t)op.a * TILE + r] += a * inv;
 					adj[(idx_t)op.b * TILE + r] += a * (-lv) * inv * inv;
+				}
+				break;
+			case OpKind::POW:
+				for (idx_t r = 0; r < tile_count; r++) {
+					const double a  = adj[i * TILE + r];
+					const double lv = vals[(idx_t)op.a * TILE + r];
+					const double rv = vals[(idx_t)op.b * TILE + r];
+					adj[(idx_t)op.a * TILE + r] += a * rv * std::pow(lv, rv - 1.0);
+					adj[(idx_t)op.b * TILE + r] += (lv > 0.0) ? a * std::pow(lv, rv) * std::log(lv) : 0.0;
 				}
 				break;
 			default:
