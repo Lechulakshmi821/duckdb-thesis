@@ -4,6 +4,8 @@ add_library_unity(duckdb_func_generic_main OBJECT
 
 add_library_unity(duckdb_func_generic_autodiff_fwd OBJECT
     autodiff_grad.cpp
+    autodiff_jit.cpp
+    autodiff_rev_jit.cpp
 )
 
 add_library_unity(duckdb_func_generic_autodiff_rev OBJECT

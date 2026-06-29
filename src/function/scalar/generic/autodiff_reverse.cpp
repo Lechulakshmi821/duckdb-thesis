@@ -23,6 +23,12 @@
 #include <limits>
 #include <vector>
 
+#define DUCKDB_HAVE_LLVM
+#ifdef DUCKDB_HAVE_LLVM
+using RevJitFuncType = void(*)(const double*, double*);
+extern RevJitFuncType CompileRevJITBridge(const void* prog_ptr, const void* root_ptr, const void* input_node_ptr, uint64_t N);
+#endif
+
 namespace duckdb {
 
 // Tile size for vectorized reverse-mode tape replay.
@@ -296,6 +302,9 @@ struct AutoDiffGradCompiledBindData : public FunctionData {
 
 	// Symbolic derivative trees (one SymProg per parameter)
 	std::vector<SymProg> sym_derivs;
+#ifdef DUCKDB_HAVE_LLVM
+	void* jit_func = nullptr;
+#endif
 	std::vector<int32_t> sym_roots;
 	std::vector<int32_t> sym_fwd;
 	std::vector<double> sym_scratch; // pre-allocated eval buffer
@@ -616,6 +625,16 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 		bind_data->sym_roots[p]  = dr;
 	}
 
+#ifdef DUCKDB_HAVE_LLVM
+	// JIT compile tape to native code (forward + backward pass as native code)
+	if (!bind_data->prog.empty()) {
+		bind_data->jit_func = (void*)CompileRevJITBridge(
+			(const void*)&bind_data->prog,
+			(const void*)&bind_data->root,
+			(const void*)&bind_data->input_node,
+			(uint64_t)n_params);
+	}
+#endif
 	return std::move(bind_data);
 }
 
@@ -646,6 +665,19 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 	const auto &prog = bind.prog;
 	const int32_t root = bind.root;
 
+#ifdef DUCKDB_HAVE_LLVM
+	// JIT path: fastest — direct native code
+	if (bind.jit_func) {
+		auto fn = (RevJitFuncType)bind.jit_func;
+		std::vector<double> inputs(N), grads(N);
+		for (idx_t r = 0; r < count; r++) {
+			for (idx_t j = 0; j < N; j++) inputs[j] = in.Get(j, r);
+			fn(inputs.data(), grads.data());
+			for (idx_t j = 0; j < N; j++) child_ptrs[j][r] = grads[j];
+		}
+		return;
+	}
+#endif
 	// --- Symbolic path: if sym_derivs were generated at bind time, use them ---
 	if (false && !bind.sym_derivs.empty() && (int32_t)bind.sym_derivs.size() == (int32_t)N) {
 		// Pre-allocate scratch buffer — reused across all rows and params

@@ -21,6 +21,13 @@
 #include <vector>
 #include <unordered_map>
 
+#define DUCKDB_HAVE_LLVM
+// Bridge to JIT implementation in autodiff_jit.cpp (outside duckdb namespace)
+#ifdef DUCKDB_HAVE_LLVM
+using JitFuncType = void(*)(const double*, double*);
+extern JitFuncType CompileJITBridge(const void* prog_ptr, int32_t root, uint64_t N);
+#endif
+
 namespace duckdb {
 
 
@@ -50,6 +57,9 @@ struct AutoDiffGradBindData : public FunctionData {
 	std::unordered_map<Expression*, OpKind> op_cache;
 	std::vector<FwdOp> prog;
 	int32_t root = -1;
+#ifdef DUCKDB_HAVE_LLVM
+	void* jit_func = nullptr;
+#endif
 
 	AutoDiffGradBindData(unique_ptr<Expression> expr_p, idx_t nparams_p)
 	    : lambda_expr(std::move(expr_p)), param_cnt(nparams_p) {
@@ -542,6 +552,10 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 		bind_data->root=remap[(idx_t)bind_data->root];
 		bind_data->prog=std::move(new_prog);
 	}
+#ifdef DUCKDB_HAVE_LLVM
+	bind_data->jit_func = (void*)CompileJITBridge((const void*)&bind_data->prog, bind_data->root, (uint64_t)n_params);
+	Printer::Print(bind_data->jit_func ? "[JIT] compiled OK" : "[JIT] failed");
+#endif
 	return std::move(bind_data);
 }
 
@@ -570,6 +584,18 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 		out_ptr[j] = FlatVector::GetData<double>(*children[j]);
 	}
 
+	// JIT path: native code execution
+#ifdef DUCKDB_HAVE_LLVM
+	if (bind.jit_func) {
+		auto fn = (JitFuncType)bind.jit_func;
+		std::vector<double> inputs(N), grads(N);
+		for (idx_t r = 0; r < count; r++) {
+			for (idx_t j = 0; j < N; j++) inputs[j] = in.Get(j, r);
+			fn(inputs.data(), grads.data());
+			for (idx_t j = 0; j < N; j++) out_ptr[j][r] = grads[j];
+		}
+	} else
+#endif
 	// Use compiled tape with tiled vectorisation
 	if (!bind.prog.empty() && bind.root >= 0) {
 		const idx_t sz = (idx_t)bind.root + 1;

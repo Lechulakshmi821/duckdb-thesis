@@ -22,7 +22,7 @@ find_package(Threads REQUIRED)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set (CMAKE_CXX_STANDARD 11)
+set (CMAKE_CXX_STANDARD 17)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -1066,6 +1066,21 @@ if(NOT CLANG_TIDY)
   if (NOT EXTENSION_CONFIG_BUILD)
     add_subdirectory(third_party)
   endif()
+endif()
+
+# LLVM JIT support for forward-mode AD
+set(LLVM_DIR "/usr/lib/llvm-18/lib/cmake/llvm" CACHE PATH "LLVM cmake dir")
+set(CMAKE_PREFIX_PATH "/usr/lib/llvm-18" ${CMAKE_PREFIX_PATH})
+find_package(LLVM REQUIRED CONFIG)
+if(LLVM_FOUND)
+  message(STATUS "LLVM ${LLVM_PACKAGE_VERSION} found — enabling JIT")
+  include_directories("/usr/lib/llvm-18/include")
+  add_definitions(-DDUCKDB_HAVE_LLVM)
+  cmake_policy(SET CMP0079 NEW)
+  target_link_libraries(duckdb_static "/usr/lib/llvm-18/lib/libLLVM-18.so")
+  target_link_libraries(duckdb "/usr/lib/llvm-18/lib/libLLVM-18.so")
+else()
+  message(STATUS "LLVM not found — JIT disabled")
 endif()
 
 # Deploys extensions to a local repository (a folder structure that contains the duckdb version + binary arch)
