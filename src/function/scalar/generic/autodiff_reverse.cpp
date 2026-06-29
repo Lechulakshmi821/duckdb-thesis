@@ -105,6 +105,182 @@ struct CompiledOp {
 	double cval = 0.0;       // CONST only
 };
 
+
+//------------------------------------------------------------------------------
+// Symbolic expression tree for bind-time derivative generation
+// Following Prof. Schüle's LingoDB deriveDerivation pattern
+//------------------------------------------------------------------------------
+enum class SymOp : uint8_t {
+    CONST,   // constant value
+    PARAM,   // input parameter (slot index)
+    ADD,     // left + right
+    SUB,     // left - right
+    MUL,     // left * right
+    DIV,     // left / right
+    NEG,     // -child
+    POW,     // left ^ right
+};
+
+struct SymNode {
+    SymOp op;
+    double cval = 0.0;      // CONST only
+    int32_t slot = -1;      // PARAM only
+    int32_t left = -1;      // binary ops
+    int32_t right = -1;     // binary ops
+    int32_t child = -1;     // unary ops
+};
+
+// Symbolic expression tree — stored as a flat vector (like prog)
+using SymProg = std::vector<SymNode>;
+
+static int32_t SymConst(SymProg &s, double v) {
+    SymNode n; n.op=SymOp::CONST; n.cval=v; s.push_back(n);
+    return (int32_t)s.size() - 1;
+}
+static int32_t SymParam(SymProg &s, int32_t slot) {
+    SymNode n; n.op=SymOp::PARAM; n.slot=slot; s.push_back(n);
+    return (int32_t)s.size() - 1;
+}
+static int32_t SymAdd(SymProg &s, int32_t l, int32_t r) {
+    SymNode n; n.op=SymOp::ADD; n.left=l; n.right=r; s.push_back(n);
+    return (int32_t)s.size() - 1;
+}
+static int32_t SymSub(SymProg &s, int32_t l, int32_t r) {
+    SymNode n; n.op=SymOp::SUB; n.left=l; n.right=r; s.push_back(n);
+    return (int32_t)s.size() - 1;
+}
+static int32_t SymMul(SymProg &s, int32_t l, int32_t r) {
+    SymNode n; n.op=SymOp::MUL; n.left=l; n.right=r; s.push_back(n);
+    return (int32_t)s.size() - 1;
+}
+static int32_t SymDiv(SymProg &s, int32_t l, int32_t r) {
+    SymNode n; n.op=SymOp::DIV; n.left=l; n.right=r; s.push_back(n);
+    return (int32_t)s.size() - 1;
+}
+static int32_t SymNeg(SymProg &s, int32_t c) {
+    SymNode n; n.op=SymOp::NEG; n.child=c; s.push_back(n);
+    return (int32_t)s.size() - 1;
+}
+static int32_t SymPow(SymProg &s, int32_t l, int32_t r) {
+    SymNode n; n.op=SymOp::POW; n.left=l; n.right=r; s.push_back(n);
+    return (int32_t)s.size() - 1;
+}
+
+
+//------------------------------------------------------------------------------
+// SymDiff: symbolic differentiation following Prof. Schüle's LingoDB pattern
+// Given a compiled prog and a node index, returns the derivative node index
+// with respect to param `wrt_slot`, building into `deriv` SymProg.
+// `fwd` holds the forward expression nodes (mirroring prog as SymNodes).
+//------------------------------------------------------------------------------
+// SymForward: copy forward expression for prog[node] into deriv as self-contained SymNodes
+static int32_t SymForward(const std::vector<CompiledOp> &prog, int32_t node, SymProg &deriv) {
+	if (node < 0) return SymConst(deriv, 0.0);
+	const auto &op = prog[(idx_t)node];
+	switch (op.op) {
+	case OpKind::INPUT: return SymParam(deriv, op.input_slot);
+	case OpKind::CONST: return SymConst(deriv, op.cval);
+	case OpKind::NEG:   return SymNeg(deriv, SymForward(prog, op.a, deriv));
+	case OpKind::ADD:   return SymAdd(deriv, SymForward(prog, op.a, deriv), SymForward(prog, op.b, deriv));
+	case OpKind::SUB:   return SymSub(deriv, SymForward(prog, op.a, deriv), SymForward(prog, op.b, deriv));
+	case OpKind::MUL:   return SymMul(deriv, SymForward(prog, op.a, deriv), SymForward(prog, op.b, deriv));
+	case OpKind::DIV:   return SymDiv(deriv, SymForward(prog, op.a, deriv), SymForward(prog, op.b, deriv));
+	case OpKind::POW:   return SymPow(deriv, SymForward(prog, op.a, deriv), SymForward(prog, op.b, deriv));
+	default: return SymConst(deriv, 0.0);
+	}
+}
+
+static int32_t SymDiff(const std::vector<CompiledOp> &prog,
+                       int32_t node,
+                       int32_t wrt_slot,
+                       SymProg &deriv) {
+	if (node < 0) return SymConst(deriv, 0.0);
+	const auto &op = prog[(idx_t)node];
+	switch (op.op) {
+	case OpKind::CONST:
+		return SymConst(deriv, 0.0);
+	case OpKind::INPUT:
+		return (op.input_slot == wrt_slot) ? SymConst(deriv, 1.0) : SymConst(deriv, 0.0);
+	case OpKind::NEG: {
+		auto du = SymDiff(prog, op.a, wrt_slot, deriv);
+		return SymNeg(deriv, du);
+	}
+	case OpKind::ADD: {
+		auto du = SymDiff(prog, op.a, wrt_slot, deriv);
+		auto dv = SymDiff(prog, op.b, wrt_slot, deriv);
+		return SymAdd(deriv, du, dv);
+	}
+	case OpKind::SUB: {
+		auto du = SymDiff(prog, op.a, wrt_slot, deriv);
+		auto dv = SymDiff(prog, op.b, wrt_slot, deriv);
+		return SymSub(deriv, du, dv);
+	}
+	case OpKind::MUL: {
+		auto du = SymDiff(prog, op.a, wrt_slot, deriv);
+		auto dv = SymDiff(prog, op.b, wrt_slot, deriv);
+		auto u  = SymForward(prog, op.a, deriv);
+		auto v  = SymForward(prog, op.b, deriv);
+		auto t1 = SymMul(deriv, du, v);
+		auto t2 = SymMul(deriv, u, dv);
+		return SymAdd(deriv, t1, t2);
+	}
+	case OpKind::DIV: {
+		auto du  = SymDiff(prog, op.a, wrt_slot, deriv);
+		auto dv  = SymDiff(prog, op.b, wrt_slot, deriv);
+		auto u   = SymForward(prog, op.a, deriv);
+		auto v   = SymForward(prog, op.b, deriv);
+		auto v2  = SymForward(prog, op.b, deriv);
+		auto t1  = SymMul(deriv, du, v);
+		auto t2  = SymMul(deriv, u, dv);
+		auto num = SymSub(deriv, t1, t2);
+		auto c2  = SymConst(deriv, 2.0);
+		auto den = SymPow(deriv, v2, c2);
+		return SymDiv(deriv, num, den);
+	}
+	case OpKind::POW: {
+		auto du   = SymDiff(prog, op.a, wrt_slot, deriv);
+		auto u    = SymForward(prog, op.a, deriv);
+		auto v    = SymForward(prog, op.b, deriv);
+		auto v2   = SymForward(prog, op.b, deriv);
+		auto c1   = SymConst(deriv, 1.0);
+		auto vm1  = SymSub(deriv, v, c1);
+		auto upow = SymPow(deriv, u, vm1);
+		auto t1   = SymMul(deriv, v2, upow);
+		return SymMul(deriv, t1, du);
+	}
+	default:
+		return SymConst(deriv, 0.0);
+	}
+}
+
+//------------------------------------------------------------------------------
+// EvalSymLinear: evaluate a SymProg node iteratively, returning a scalar value for one row
+//------------------------------------------------------------------------------
+// EvalSymLinear: evaluate SymProg iteratively (no recursion, pre-allocated buffer)
+static double EvalSymLinear(const SymProg &prog, int32_t root,
+                            const RowInput &in, idx_t row,
+                            std::vector<double> &vals) {
+	if (root < 0) return 0.0;
+	const idx_t sz = (idx_t)root + 1;
+	if (vals.size() < sz) vals.resize(sz);
+	for (idx_t i = 0; i < sz; i++) {
+		const auto &n = prog[i];
+		switch (n.op) {
+		case SymOp::CONST: vals[i] = n.cval; break;
+		case SymOp::PARAM: vals[i] = in.Get((idx_t)n.slot, row); break;
+		case SymOp::NEG:   vals[i] = -vals[(idx_t)n.child]; break;
+		case SymOp::ADD:   vals[i] = vals[(idx_t)n.left] + vals[(idx_t)n.right]; break;
+		case SymOp::SUB:   vals[i] = vals[(idx_t)n.left] - vals[(idx_t)n.right]; break;
+		case SymOp::MUL:   vals[i] = vals[(idx_t)n.left] * vals[(idx_t)n.right]; break;
+		case SymOp::DIV:   vals[i] = vals[(idx_t)n.left] / vals[(idx_t)n.right]; break;
+		case SymOp::POW:   vals[i] = std::pow(vals[(idx_t)n.left], vals[(idx_t)n.right]); break;
+		default:           vals[i] = 0.0; break;
+		}
+	}
+	return vals[(idx_t)root];
+}
+
+
 //------------------------------------------------------------------------------
 // Bind data (RENAMED to avoid layout/ODR issues)
 //------------------------------------------------------------------------------
@@ -118,6 +294,12 @@ struct AutoDiffGradCompiledBindData : public FunctionData {
 	// slot -> node index in prog (or -1 if unused)
 	std::vector<int32_t> input_node;
 
+	// Symbolic derivative trees (one SymProg per parameter)
+	std::vector<SymProg> sym_derivs;
+	std::vector<int32_t> sym_roots;
+	std::vector<int32_t> sym_fwd;
+	std::vector<double> sym_scratch; // pre-allocated eval buffer
+
 	AutoDiffGradCompiledBindData(unique_ptr<Expression> lambda_expr_p, idx_t param_cnt_p)
 	    : lambda_expr(std::move(lambda_expr_p)), param_cnt(param_cnt_p), input_node(param_cnt_p, -1) {
 	}
@@ -127,6 +309,10 @@ struct AutoDiffGradCompiledBindData : public FunctionData {
 		out->prog = prog;
 		out->root = root;
 		out->input_node = input_node;
+		out->sym_derivs = sym_derivs;
+		out->sym_roots = sym_roots;
+		out->sym_fwd = sym_fwd;
+		out->sym_scratch = sym_scratch;
 		return out;
 	}
 
@@ -283,6 +469,57 @@ static int32_t CompileExpr(Expression &expr,
 	}
 }
 
+
+//------------------------------------------------------------------------------
+// CSE: Common Subexpression Elimination on compiled prog
+// Scans for structurally identical nodes and merges them.
+// Returns a remapping vector: remap[old_idx] = new_idx
+//------------------------------------------------------------------------------
+static void ApplyCSE(std::vector<CompiledOp> &prog, int32_t &root) {
+	if (prog.empty()) return;
+
+	// Build canonical key for each node
+	// Key: (op, a_remapped, b_remapped, input_slot, cval)
+	std::vector<int32_t> remap(prog.size(), -1);
+	std::vector<CompiledOp> new_prog;
+	new_prog.reserve(prog.size());
+
+	// Map from key string to new index
+	std::unordered_map<std::string, int32_t> seen;
+
+	auto make_key = [&](const CompiledOp &op, int32_t ra, int32_t rb) -> std::string {
+		char buf[64];
+		snprintf(buf, sizeof(buf), "%d:%d:%d:%d:%.17g",
+			(int)op.op, ra, rb, op.input_slot, op.cval);
+		return std::string(buf);
+	};
+
+	for (idx_t i = 0; i < prog.size(); i++) {
+		CompiledOp op = prog[i];
+		// Remap children
+		int32_t ra = (op.a >= 0) ? remap[(idx_t)op.a] : -1;
+		int32_t rb = (op.b >= 0) ? remap[(idx_t)op.b] : -1;
+		op.a = ra;
+		op.b = rb;
+
+		std::string key = make_key(op, ra, rb);
+		auto it = seen.find(key);
+		if (it != seen.end()) {
+			// Duplicate — reuse existing node
+			remap[i] = it->second;
+		} else {
+			// New node
+			int32_t new_idx = (int32_t)new_prog.size();
+			new_prog.push_back(op);
+			seen[key] = new_idx;
+			remap[i] = new_idx;
+		}
+	}
+
+	root = remap[(idx_t)root];
+	prog = std::move(new_prog);
+}
+
 //------------------------------------------------------------------------------
 // Bind: compile once
 //------------------------------------------------------------------------------
@@ -334,6 +571,51 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 	std::vector<int32_t> input_cache(n_params, -1);
 	bind_data->root = CompileExpr(*bind_data->lambda_expr, n_params, bind_data->prog, input_cache, bind_data->input_node, ble.captures);
 
+	// Apply CSE to reduce tape size
+	ApplyCSE(bind_data->prog, bind_data->root);
+	// Rebuild input_node mapping after CSE remap
+	std::fill(bind_data->input_node.begin(), bind_data->input_node.end(), -1);
+	for (idx_t i = 0; i < bind_data->prog.size(); i++) {
+		if (bind_data->prog[i].op == OpKind::INPUT) {
+			bind_data->input_node[(idx_t)bind_data->prog[i].input_slot] = (int32_t)i;
+		}
+	}
+
+	// Build forward SymProg mirroring prog
+	const idx_t prog_size = bind_data->prog.size();
+	SymProg fwd_prog;
+	std::vector<int32_t> fwd_idx(prog_size, -1);
+	for (idx_t i = 0; i < prog_size; i++) {
+		const auto &op = bind_data->prog[i];
+		if      (op.op == OpKind::INPUT) fwd_idx[i] = SymParam(fwd_prog, op.input_slot);
+		else if (op.op == OpKind::CONST) fwd_idx[i] = SymConst(fwd_prog, op.cval);
+		else if (op.op == OpKind::NEG)   fwd_idx[i] = SymNeg(fwd_prog, fwd_idx[(idx_t)op.a]);
+		else if (op.op == OpKind::ADD)   fwd_idx[i] = SymAdd(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+		else if (op.op == OpKind::SUB)   fwd_idx[i] = SymSub(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+		else if (op.op == OpKind::MUL)   fwd_idx[i] = SymMul(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+		else if (op.op == OpKind::DIV)   fwd_idx[i] = SymDiv(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+		else if (op.op == OpKind::POW)   fwd_idx[i] = SymPow(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+	}
+
+	// Generate symbolic derivative for each parameter
+	bind_data->sym_derivs.resize(n_params);
+	bind_data->sym_roots.resize(n_params, -1);
+	for (idx_t p = 0; p < n_params; p++) {
+		SymProg dp;
+		int32_t dr = SymDiff(bind_data->prog, bind_data->root, (int32_t)p, dp);
+		// dp is self-contained, no fwd_prog needed
+		idx_t offset = fwd_prog.size();
+		for (auto &sn : dp) {
+			if (sn.left  >= 0) sn.left  += (int32_t)offset;
+			if (sn.right >= 0) sn.right += (int32_t)offset;
+			if (sn.child >= 0) sn.child += (int32_t)offset;
+		}
+		dr += (int32_t)offset;
+		dp.insert(dp.begin(), fwd_prog.begin(), fwd_prog.end());
+		bind_data->sym_derivs[p] = std::move(dp);
+		bind_data->sym_roots[p]  = dr;
+	}
+
 	return std::move(bind_data);
 }
 
@@ -364,6 +646,21 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 	const auto &prog = bind.prog;
 	const int32_t root = bind.root;
 
+	// --- Symbolic path: if sym_derivs were generated at bind time, use them ---
+	if (false && !bind.sym_derivs.empty() && (int32_t)bind.sym_derivs.size() == (int32_t)N) {
+		// Pre-allocate scratch buffer — reused across all rows and params
+		idx_t max_sz = 0;
+		for (idx_t j = 0; j < N; j++) if (!bind.sym_derivs[j].empty()) max_sz = std::max(max_sz, (idx_t)bind.sym_derivs[j].size());
+		std::vector<double> scratch(max_sz);
+		for (idx_t row = 0; row < count; row++) {
+			for (idx_t j = 0; j < N; j++) {
+				child_ptrs[j][row] = EvalSymLinear(bind.sym_derivs[j], bind.sym_roots[j], in, row, scratch);
+			}
+		}
+		return;
+	}
+
+	// --- Tape-based path (fallback) ---
 	// Tiled vectorized tape replay.
 	// Working buffers are sized per tile so they fit in L2 cache.
 	// Within each tile, the per-row loop runs the original forward/backward
