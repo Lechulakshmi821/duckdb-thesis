@@ -570,36 +570,90 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 		out_ptr[j] = FlatVector::GetData<double>(*children[j]);
 	}
 
-	// Use compiled tape if available (faster than recursive EvalExpr)
+	// Use compiled tape with tiled vectorisation
 	if (!bind.prog.empty() && bind.root >= 0) {
 		const idx_t sz = (idx_t)bind.root + 1;
-		std::vector<Dual> tape(sz, Dual());
-		for (idx_t r = 0; r < count; r++) {
+		const idx_t TILE = 64; // smaller tile: sz*TILE*N doubles must fit in L2
+		// val[i*TILE+r] = value of node i for row r in tile
+		// grad[i*TILE*N + r*N + j] = gradient of node i for row r, param j
+		std::vector<double> val(sz * TILE);
+		std::vector<double> grad(sz * TILE * N);
+
+		for (idx_t tile_start = 0; tile_start < count; tile_start += TILE) {
+			const idx_t tc = std::min(TILE, count - tile_start);
+
 			for (idx_t i = 0; i < sz; i++) {
 				const auto &op = bind.prog[i];
 				switch (op.op) {
-				case FwdOpKind::INPUT: {
-					tape[i] = MakeInput(in.Get((idx_t)op.input_slot, r), (idx_t)op.input_slot, N);
+				case FwdOpKind::INPUT:
+					for (idx_t r = 0; r < tc; r++) {
+						val[i*TILE+r] = in.Get((idx_t)op.input_slot, tile_start+r);
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = (j==(idx_t)op.input_slot) ? 1.0 : 0.0;
+					}
+					break;
+				case FwdOpKind::CONST:
+					for (idx_t r = 0; r < tc; r++) {
+						val[i*TILE+r] = op.cval;
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = 0.0;
+					}
+					break;
+				case FwdOpKind::NEG:
+					for (idx_t r = 0; r < tc; r++) {
+						val[i*TILE+r] = -val[(idx_t)op.a*TILE+r];
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = -grad[(idx_t)op.a*TILE*N+r*N+j];
+					}
+					break;
+				case FwdOpKind::ADD:
+					for (idx_t r = 0; r < tc; r++) {
+						val[i*TILE+r] = val[(idx_t)op.a*TILE+r] + val[(idx_t)op.b*TILE+r];
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = grad[(idx_t)op.a*TILE*N+r*N+j] + grad[(idx_t)op.b*TILE*N+r*N+j];
+					}
+					break;
+				case FwdOpKind::SUB:
+					for (idx_t r = 0; r < tc; r++) {
+						val[i*TILE+r] = val[(idx_t)op.a*TILE+r] - val[(idx_t)op.b*TILE+r];
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = grad[(idx_t)op.a*TILE*N+r*N+j] - grad[(idx_t)op.b*TILE*N+r*N+j];
+					}
+					break;
+				case FwdOpKind::MUL:
+					for (idx_t r = 0; r < tc; r++) {
+						double lv = val[(idx_t)op.a*TILE+r], rv = val[(idx_t)op.b*TILE+r];
+						val[i*TILE+r] = lv * rv;
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = grad[(idx_t)op.a*TILE*N+r*N+j]*rv + grad[(idx_t)op.b*TILE*N+r*N+j]*lv;
+					}
+					break;
+				case FwdOpKind::DIV:
+					for (idx_t r = 0; r < tc; r++) {
+						double lv = val[(idx_t)op.a*TILE+r], rv = val[(idx_t)op.b*TILE+r];
+						double inv = 1.0/rv;
+						val[i*TILE+r] = lv * inv;
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = (grad[(idx_t)op.a*TILE*N+r*N+j]*rv - grad[(idx_t)op.b*TILE*N+r*N+j]*lv)*inv*inv;
+					}
+					break;
+				case FwdOpKind::POW:
+					for (idx_t r = 0; r < tc; r++) {
+						double lv = val[(idx_t)op.a*TILE+r], rv = val[(idx_t)op.b*TILE+r];
+						double pv = std::pow(lv, rv);
+						val[i*TILE+r] = pv;
+						for (idx_t j = 0; j < N; j++) {
+							double dv = rv * std::pow(lv, rv-1.0) * grad[(idx_t)op.a*TILE*N+r*N+j];
+							if (lv > 0.0) dv += pv * std::log(lv) * grad[(idx_t)op.b*TILE*N+r*N+j];
+							grad[i*TILE*N+r*N+j] = dv;
+						}
+					}
+					break;
+				default:
+					for (idx_t r = 0; r < tc; r++) {
+						val[i*TILE+r] = 0.0;
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = 0.0;
+					}
 					break;
 				}
-				case FwdOpKind::CONST:
-					tape[i] = MakeConst(op.cval, N); break;
-				case FwdOpKind::NEG:
-					tape[i] = Neg(tape[(idx_t)op.a]); break;
-				case FwdOpKind::ADD:
-					tape[i] = Add(tape[(idx_t)op.a], tape[(idx_t)op.b]); break;
-				case FwdOpKind::SUB:
-					tape[i] = Sub(tape[(idx_t)op.a], tape[(idx_t)op.b]); break;
-				case FwdOpKind::MUL:
-					tape[i] = Mul(tape[(idx_t)op.a], tape[(idx_t)op.b]); break;
-				case FwdOpKind::DIV:
-					tape[i] = Div(tape[(idx_t)op.a], tape[(idx_t)op.b]); break;
-				case FwdOpKind::POW:
-					tape[i] = Pow(tape[(idx_t)op.a], tape[(idx_t)op.b], N); break;
-				default: tape[i] = MakeConst(0.0, N); break;
-				}
 			}
-			for (idx_t j = 0; j < N; j++) out_ptr[j][r] = tape[(idx_t)bind.root].grad[j];
+			// Emit gradients for this tile
+			for (idx_t j = 0; j < N; j++)
+				for (idx_t r = 0; r < tc; r++)
+					out_ptr[j][tile_start+r] = grad[(idx_t)bind.root*TILE*N+r*N+j];
 		}
 	} else {
 		for (idx_t r = 0; r < count; r++) {
