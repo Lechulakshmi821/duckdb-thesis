@@ -1,0 +1,61 @@
+.timer on
+
+CREATE OR REPLACE TABLE data AS
+SELECT
+    random() AS x1, random() AS x2, random() AS x3,
+    random() AS x4, random() AS x5, random() AS x6,
+    random() AS y6
+FROM range(50000);
+
+CREATE OR REPLACE TABLE models(name VARCHAR, loss_fn STORED_LAMBDA);
+INSERT INTO models VALUES (
+    'linear',
+    '(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14) -> (p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)*(p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)'
+);
+INSERT INTO models VALUES (
+    'quadratic',
+    '(p1,p2) -> (p1*p2)*(p1*p2)'
+);
+
+SELECT 'inline_static' AS method,
+       mygrad_rev(
+           1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE,
+           x1, x2, x3, x4, x5, x6, y6,
+           (p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14) ->
+               (p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)
+             * (p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)
+       )
+FROM data;
+
+SELECT 'stored_constant' AS method,
+       mygrad_rev(
+           1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE,
+           x1, x2, x3, x4, x5, x6, y6,
+           (SELECT loss_fn FROM models WHERE name = 'linear')
+       )
+FROM data;
+
+SELECT 'stored_dynamic' AS method,
+       mygrad_rev(
+           1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE,
+           data.x1, data.x2, data.x3, data.x4, data.x5, data.x6, data.y6,
+           models.loss_fn
+       )
+FROM data, models
+WHERE models.name = 'linear';
+
+SELECT count(*) AS mismatched_rows
+FROM (
+    SELECT
+        mygrad_rev(1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,
+                   data.x1,data.x2,data.x3,data.x4,data.x5,data.x6,data.y6,
+                   models.loss_fn) AS dyn,
+        mygrad_rev(1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,
+                   data.x1,data.x2,data.x3,data.x4,data.x5,data.x6,data.y6,
+                   (SELECT loss_fn FROM models WHERE name = 'linear')) AS const
+    FROM data, models
+    WHERE models.name = 'linear'
+) t
+WHERE dyn != const OR isnan(dyn.d1);
+
+.timer off

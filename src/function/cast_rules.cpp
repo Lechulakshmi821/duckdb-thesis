@@ -224,6 +224,10 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 		// Implicit cast not allowed from BLOB to VARCHAR
 		return -1;
 	}
+	if (from.id() == LogicalTypeId::VARCHAR && to.id() == LogicalTypeId::STORED_LAMBDA) {
+		// A VARCHAR literal can be implicitly cast to STORED_LAMBDA (same underlying storage)
+		return TargetTypeCost(to);
+	}
 	if (to.id() == LogicalTypeId::VARCHAR) {
 		// everything can be cast to VARCHAR, but this cast has a high cost
 		return TargetTypeCost(to);

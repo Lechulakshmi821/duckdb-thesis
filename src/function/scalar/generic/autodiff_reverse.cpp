@@ -15,12 +15,15 @@
 #include "duckdb/planner/expression/bound_lambda_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "autodiff_stored_lambda.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <unordered_map>
 #include <vector>
 
 #define DUCKDB_HAVE_LLVM
@@ -31,9 +34,6 @@ extern RevJitFuncType CompileRevJITBridge(const void* prog_ptr, const void* root
 
 namespace duckdb {
 
-// Tile size for vectorized reverse-mode tape replay.
-// Chosen so that the per-tile working set (TILE_SIZE * prog.size() doubles
-// for each of vals and adj) fits in L2 cache.
 static constexpr idx_t MYGRAD_REV_TILE_SIZE = 256;
 
 //------------------------------------------------------------------------------
@@ -58,14 +58,13 @@ struct RowInput {
 };
 
 //------------------------------------------------------------------------------
-// NameToSlot (your current logic)
+// NameToSlot
 //------------------------------------------------------------------------------
 static inline bool NameToSlot(const string &raw_in, idx_t param_cnt, idx_t &slot_out) {
 	string s = raw_in;
 	StringUtil::Trim(s);
 	s = StringUtil::Lower(s);
 
-	// Special-case 4-arg lambdas: (w,b,x,y)
 	if (param_cnt == 4) {
 		if (s == "w") { slot_out = 0; return true; }
 		if (s == "b") { slot_out = 1; return true; }
@@ -73,14 +72,12 @@ static inline bool NameToSlot(const string &raw_in, idx_t param_cnt, idx_t &slot
 		if (s == "y") { slot_out = 3; return true; }
 	}
 
-	// Backward-compatible mapping for <= 3 params
 	if (param_cnt <= 3) {
 		if (s == "u" || s == "x" || s == "a") { slot_out = 0; return slot_out < param_cnt; }
 		if (s == "v" || s == "y" || s == "b") { slot_out = 1; return slot_out < param_cnt; }
 		if (s == "w" || s == "z" || s == "c") { slot_out = 2; return slot_out < param_cnt; }
 	}
 
-	// Fallback: names with digits like p1, x14, etc.
 	idx_t pos = 0;
 	while (pos < s.size() && !std::isdigit((unsigned char)s[pos])) {
 		pos++;
@@ -105,38 +102,26 @@ enum class OpKind : uint8_t { INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW };
 
 struct CompiledOp {
 	OpKind op;
-	int32_t a = -1;          // left
-	int32_t b = -1;          // right
-	int32_t input_slot = -1; // INPUT only
-	double cval = 0.0;       // CONST only
+	int32_t a = -1;
+	int32_t b = -1;
+	int32_t input_slot = -1;
+	double cval = 0.0;
 };
 
-
 //------------------------------------------------------------------------------
-// Symbolic expression tree for bind-time derivative generation
-// Following Prof. Schüle's LingoDB deriveDerivation pattern
+// Symbolic expression tree
 //------------------------------------------------------------------------------
-enum class SymOp : uint8_t {
-    CONST,   // constant value
-    PARAM,   // input parameter (slot index)
-    ADD,     // left + right
-    SUB,     // left - right
-    MUL,     // left * right
-    DIV,     // left / right
-    NEG,     // -child
-    POW,     // left ^ right
-};
+enum class SymOp : uint8_t { CONST, PARAM, ADD, SUB, MUL, DIV, NEG, POW };
 
 struct SymNode {
     SymOp op;
-    double cval = 0.0;      // CONST only
-    int32_t slot = -1;      // PARAM only
-    int32_t left = -1;      // binary ops
-    int32_t right = -1;     // binary ops
-    int32_t child = -1;     // unary ops
+    double cval = 0.0;
+    int32_t slot = -1;
+    int32_t left = -1;
+    int32_t right = -1;
+    int32_t child = -1;
 };
 
-// Symbolic expression tree — stored as a flat vector (like prog)
 using SymProg = std::vector<SymNode>;
 
 static int32_t SymConst(SymProg &s, double v) {
@@ -172,14 +157,6 @@ static int32_t SymPow(SymProg &s, int32_t l, int32_t r) {
     return (int32_t)s.size() - 1;
 }
 
-
-//------------------------------------------------------------------------------
-// SymDiff: symbolic differentiation following Prof. Schüle's LingoDB pattern
-// Given a compiled prog and a node index, returns the derivative node index
-// with respect to param `wrt_slot`, building into `deriv` SymProg.
-// `fwd` holds the forward expression nodes (mirroring prog as SymNodes).
-//------------------------------------------------------------------------------
-// SymForward: copy forward expression for prog[node] into deriv as self-contained SymNodes
 static int32_t SymForward(const std::vector<CompiledOp> &prog, int32_t node, SymProg &deriv) {
 	if (node < 0) return SymConst(deriv, 0.0);
 	const auto &op = prog[(idx_t)node];
@@ -259,10 +236,6 @@ static int32_t SymDiff(const std::vector<CompiledOp> &prog,
 	}
 }
 
-//------------------------------------------------------------------------------
-// EvalSymLinear: evaluate a SymProg node iteratively, returning a scalar value for one row
-//------------------------------------------------------------------------------
-// EvalSymLinear: evaluate SymProg iteratively (no recursion, pre-allocated buffer)
 static double EvalSymLinear(const SymProg &prog, int32_t root,
                             const RowInput &in, idx_t row,
                             std::vector<double> &vals) {
@@ -286,9 +259,8 @@ static double EvalSymLinear(const SymProg &prog, int32_t root,
 	return vals[(idx_t)root];
 }
 
-
 //------------------------------------------------------------------------------
-// Bind data (RENAMED to avoid layout/ODR issues)
+// Bind data
 //------------------------------------------------------------------------------
 struct AutoDiffGradCompiledBindData : public FunctionData {
 	unique_ptr<Expression> lambda_expr;
@@ -297,17 +269,24 @@ struct AutoDiffGradCompiledBindData : public FunctionData {
 	std::vector<CompiledOp> prog;
 	int32_t root = -1;
 
-	// slot -> node index in prog (or -1 if unused)
 	std::vector<int32_t> input_node;
 
-	// Symbolic derivative trees (one SymProg per parameter)
 	std::vector<SymProg> sym_derivs;
 #ifdef DUCKDB_HAVE_LLVM
 	void* jit_func = nullptr;
 #endif
 	std::vector<int32_t> sym_roots;
 	std::vector<int32_t> sym_fwd;
-	std::vector<double> sym_scratch; // pre-allocated eval buffer
+	std::vector<double> sym_scratch;
+
+	// --- Dynamic (per-row) stored-lambda support ---
+	bool is_dynamic_lambda = false;
+	struct DynamicTapeEntry {
+		std::vector<CompiledOp> prog;
+		int32_t root = -1;
+		std::vector<int32_t> input_node;
+	};
+	mutable std::unordered_map<std::string, std::shared_ptr<DynamicTapeEntry>> dynamic_tape_cache;
 
 	AutoDiffGradCompiledBindData(unique_ptr<Expression> lambda_expr_p, idx_t param_cnt_p)
 	    : lambda_expr(std::move(lambda_expr_p)), param_cnt(param_cnt_p), input_node(param_cnt_p, -1) {
@@ -322,6 +301,8 @@ struct AutoDiffGradCompiledBindData : public FunctionData {
 		out->sym_roots = sym_roots;
 		out->sym_fwd = sym_fwd;
 		out->sym_scratch = sym_scratch;
+		out->is_dynamic_lambda = is_dynamic_lambda;
+		out->dynamic_tape_cache = dynamic_tape_cache;
 		return out;
 	}
 
@@ -394,9 +375,7 @@ static int32_t CompileExpr(Expression &expr,
 	case ExpressionClass::BOUND_REF: {
 		string nm = expr.alias;
 		if (nm.empty()) nm = expr.ToString();
-		// Handle capture references like #0, #1, #2 etc.
 		if (!nm.empty() && nm[0] == '#') {
-			// DuckDB #N index is offset by param count; scan all captures for constants
 			for (idx_t ci = 0; ci < captures.size(); ci++) {
 				if (captures[ci]->expression_class == ExpressionClass::BOUND_CONSTANT) {
 					auto &cc = captures[ci]->Cast<BoundConstantExpression>();
@@ -464,8 +443,6 @@ static int32_t CompileExpr(Expression &expr,
 		{ throw BinderException("mygrad_rev: unsupported function '" + name + "' (children=" + std::to_string(ch.size()) + ") in compiler"); }
 	}
 	case ExpressionClass::BOUND_LAMBDA: {
-		// DuckDB routes captured constants through BOUND_LAMBDA
-		// Try to parse the string representation as a double
 		try {
 			double v = std::stod(expr.ToString());
 					return EmitConst(prog, v);
@@ -478,22 +455,16 @@ static int32_t CompileExpr(Expression &expr,
 	}
 }
 
-
 //------------------------------------------------------------------------------
-// CSE: Common Subexpression Elimination on compiled prog
-// Scans for structurally identical nodes and merges them.
-// Returns a remapping vector: remap[old_idx] = new_idx
+// CSE
 //------------------------------------------------------------------------------
 static void ApplyCSE(std::vector<CompiledOp> &prog, int32_t &root) {
 	if (prog.empty()) return;
 
-	// Build canonical key for each node
-	// Key: (op, a_remapped, b_remapped, input_slot, cval)
 	std::vector<int32_t> remap(prog.size(), -1);
 	std::vector<CompiledOp> new_prog;
 	new_prog.reserve(prog.size());
 
-	// Map from key string to new index
 	std::unordered_map<std::string, int32_t> seen;
 
 	auto make_key = [&](const CompiledOp &op, int32_t ra, int32_t rb) -> std::string {
@@ -505,7 +476,6 @@ static void ApplyCSE(std::vector<CompiledOp> &prog, int32_t &root) {
 
 	for (idx_t i = 0; i < prog.size(); i++) {
 		CompiledOp op = prog[i];
-		// Remap children
 		int32_t ra = (op.a >= 0) ? remap[(idx_t)op.a] : -1;
 		int32_t rb = (op.b >= 0) ? remap[(idx_t)op.b] : -1;
 		op.a = ra;
@@ -514,10 +484,8 @@ static void ApplyCSE(std::vector<CompiledOp> &prog, int32_t &root) {
 		std::string key = make_key(op, ra, rb);
 		auto it = seen.find(key);
 		if (it != seen.end()) {
-			// Duplicate — reuse existing node
 			remap[i] = it->second;
 		} else {
-			// New node
 			int32_t new_idx = (int32_t)new_prog.size();
 			new_prog.push_back(op);
 			seen[key] = new_idx;
@@ -527,6 +495,159 @@ static void ApplyCSE(std::vector<CompiledOp> &prog, int32_t &root) {
 
 	root = remap[(idx_t)root];
 	prog = std::move(new_prog);
+}
+
+//------------------------------------------------------------------------------
+// Shared bind-tail: symbolic derivatives + JIT compile.
+//------------------------------------------------------------------------------
+static void FinishAutoDiffBindData(AutoDiffGradCompiledBindData &bind_data, idx_t n_params) {
+	const idx_t prog_size = bind_data.prog.size();
+	SymProg fwd_prog;
+	std::vector<int32_t> fwd_idx(prog_size, -1);
+	for (idx_t i = 0; i < prog_size; i++) {
+		const auto &op = bind_data.prog[i];
+		if      (op.op == OpKind::INPUT) fwd_idx[i] = SymParam(fwd_prog, op.input_slot);
+		else if (op.op == OpKind::CONST) fwd_idx[i] = SymConst(fwd_prog, op.cval);
+		else if (op.op == OpKind::NEG)   fwd_idx[i] = SymNeg(fwd_prog, fwd_idx[(idx_t)op.a]);
+		else if (op.op == OpKind::ADD)   fwd_idx[i] = SymAdd(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+		else if (op.op == OpKind::SUB)   fwd_idx[i] = SymSub(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+		else if (op.op == OpKind::MUL)   fwd_idx[i] = SymMul(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+		else if (op.op == OpKind::DIV)   fwd_idx[i] = SymDiv(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+		else if (op.op == OpKind::POW)   fwd_idx[i] = SymPow(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
+	}
+
+	bind_data.sym_derivs.resize(n_params);
+	bind_data.sym_roots.resize(n_params, -1);
+	for (idx_t p = 0; p < n_params; p++) {
+		SymProg dp;
+		int32_t dr = SymDiff(bind_data.prog, bind_data.root, (int32_t)p, dp);
+		idx_t offset = fwd_prog.size();
+		for (auto &sn : dp) {
+			if (sn.left  >= 0) sn.left  += (int32_t)offset;
+			if (sn.right >= 0) sn.right += (int32_t)offset;
+			if (sn.child >= 0) sn.child += (int32_t)offset;
+		}
+		dr += (int32_t)offset;
+		dp.insert(dp.begin(), fwd_prog.begin(), fwd_prog.end());
+		bind_data.sym_derivs[p] = std::move(dp);
+		bind_data.sym_roots[p]  = dr;
+	}
+
+#ifdef DUCKDB_HAVE_LLVM
+	if (!bind_data.prog.empty()) {
+		bind_data.jit_func = (void*)CompileRevJITBridge(
+			(const void*)&bind_data.prog,
+			(const void*)&bind_data.root,
+			(const void*)&bind_data.input_node,
+			(uint64_t)n_params);
+	}
+#endif
+}
+
+//------------------------------------------------------------------------------
+// Dynamic (per-row) stored-lambda support: converter + cache resolver + single-row runner
+//------------------------------------------------------------------------------
+static OpKind ConvertStoredOpKind(StoredOpKind k) {
+	switch (k) {
+	case StoredOpKind::INPUT: return OpKind::INPUT;
+	case StoredOpKind::CONST: return OpKind::CONST;
+	case StoredOpKind::NEG:   return OpKind::NEG;
+	case StoredOpKind::ADD:   return OpKind::ADD;
+	case StoredOpKind::SUB:   return OpKind::SUB;
+	case StoredOpKind::MUL:   return OpKind::MUL;
+	case StoredOpKind::DIV:   return OpKind::DIV;
+	case StoredOpKind::POW:   return OpKind::POW;
+	}
+	throw InternalException("stored lambda: unknown op kind");
+}
+
+static std::shared_ptr<AutoDiffGradCompiledBindData::DynamicTapeEntry>
+ResolveDynamicLambda(AutoDiffGradCompiledBindData &bind, const string &lambda_text, idx_t n_numeric_args) {
+	auto it = bind.dynamic_tape_cache.find(lambda_text);
+	if (it != bind.dynamic_tape_cache.end()) {
+		return it->second;
+	}
+	auto parsed = CompileStoredLambda(lambda_text);
+	if (parsed.n_params != n_numeric_args) {
+		throw InvalidInputException("mygrad_rev: stored lambda has " + std::to_string(parsed.n_params) +
+		                             " parameters but " + std::to_string(n_numeric_args) + " numeric args given");
+	}
+	auto entry = std::make_shared<AutoDiffGradCompiledBindData::DynamicTapeEntry>();
+	entry->prog.reserve(parsed.prog.size());
+	for (auto &sop : parsed.prog) {
+		CompiledOp op;
+		op.op = ConvertStoredOpKind(sop.op);
+		op.a = sop.a;
+		op.b = sop.b;
+		op.cval = sop.cval;
+		op.input_slot = sop.input_slot;
+		entry->prog.push_back(op);
+	}
+	entry->root = parsed.root;
+	ApplyCSE(entry->prog, entry->root);
+	entry->input_node.assign(n_numeric_args, -1);
+	for (idx_t i = 0; i < entry->prog.size(); i++) {
+		if (entry->prog[i].op == OpKind::INPUT) {
+			entry->input_node[(idx_t)entry->prog[i].input_slot] = (int32_t)i;
+		}
+	}
+	bind.dynamic_tape_cache[lambda_text] = entry;
+	return entry;
+}
+
+static void RunTapeSingleRow(const std::vector<CompiledOp> &prog, int32_t root,
+                             const std::vector<int32_t> &input_node,
+                             const RowInput &in, idx_t row, idx_t N,
+                             double *out_grads) {
+	std::vector<double> vals(prog.size());
+	std::vector<double> adj(prog.size(), 0.0);
+	for (idx_t i = 0; i < prog.size(); i++) {
+		const auto &op = prog[i];
+		switch (op.op) {
+		case OpKind::INPUT: vals[i] = in.Get((idx_t)op.input_slot, row); break;
+		case OpKind::CONST: vals[i] = op.cval; break;
+		case OpKind::NEG:   vals[i] = -vals[(idx_t)op.a]; break;
+		case OpKind::ADD:   vals[i] = vals[(idx_t)op.a] + vals[(idx_t)op.b]; break;
+		case OpKind::SUB:   vals[i] = vals[(idx_t)op.a] - vals[(idx_t)op.b]; break;
+		case OpKind::MUL:   vals[i] = vals[(idx_t)op.a] * vals[(idx_t)op.b]; break;
+		case OpKind::DIV:   vals[i] = vals[(idx_t)op.a] / vals[(idx_t)op.b]; break;
+		case OpKind::POW:   vals[i] = std::pow(vals[(idx_t)op.a], vals[(idx_t)op.b]); break;
+		default: vals[i] = 0.0; break;
+		}
+	}
+	if (root >= 0) adj[(idx_t)root] = 1.0;
+	for (idx_t ii = prog.size(); ii > 0; ii--) {
+		idx_t i = ii - 1;
+		const auto &op = prog[i];
+		switch (op.op) {
+		case OpKind::INPUT:
+		case OpKind::CONST: break;
+		case OpKind::NEG: adj[(idx_t)op.a] += adj[i] * -1.0; break;
+		case OpKind::ADD: adj[(idx_t)op.a] += adj[i]; adj[(idx_t)op.b] += adj[i]; break;
+		case OpKind::SUB: adj[(idx_t)op.a] += adj[i]; adj[(idx_t)op.b] += adj[i] * -1.0; break;
+		case OpKind::MUL:
+			adj[(idx_t)op.a] += adj[i] * vals[(idx_t)op.b];
+			adj[(idx_t)op.b] += adj[i] * vals[(idx_t)op.a];
+			break;
+		case OpKind::DIV: {
+			double inv = 1.0 / vals[(idx_t)op.b];
+			adj[(idx_t)op.a] += adj[i] * inv;
+			adj[(idx_t)op.b] += adj[i] * (-vals[(idx_t)op.a]) * inv * inv;
+			break;
+		}
+		case OpKind::POW: {
+			double lv = vals[(idx_t)op.a], rv = vals[(idx_t)op.b];
+			adj[(idx_t)op.a] += adj[i] * rv * std::pow(lv, rv - 1.0);
+			adj[(idx_t)op.b] += (lv > 0.0) ? adj[i] * std::pow(lv, rv) * std::log(lv) : 0.0;
+			break;
+		}
+		default: break;
+		}
+	}
+	for (idx_t j = 0; j < N; j++) {
+		int32_t node = input_node[j];
+		out_grads[j] = (node >= 0) ? adj[(idx_t)node] : 0.0;
+	}
 }
 
 //------------------------------------------------------------------------------
@@ -548,9 +669,58 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 
 	auto *last_arg = arguments.back().get();
 	if (last_arg->expression_class != ExpressionClass::BOUND_LAMBDA) {
+		Expression *unwrapped = last_arg;
+		while (unwrapped->expression_class == ExpressionClass::BOUND_CAST) {
+			unwrapped = unwrapped->Cast<BoundCastExpression>().child.get();
+		}
+		if (last_arg->return_type.id() == LogicalTypeId::STORED_LAMBDA &&
+		    unwrapped->expression_class == ExpressionClass::BOUND_CONSTANT) {
+			auto &c = unwrapped->Cast<BoundConstantExpression>();
+			string lambda_text = StringValue::Get(c.value);
+			auto parsed = CompileStoredLambda(lambda_text);
+			if (parsed.n_params != n_numeric_args) {
+				throw BinderException("mygrad_rev: stored lambda has " + std::to_string(parsed.n_params) +
+				                       " parameters but " + std::to_string(n_numeric_args) + " numeric args given");
+			}
+
+			auto dummy_lambda = make_uniq<BoundConstantExpression>(Value::DOUBLE(0.0));
+			auto bind_data = make_uniq<AutoDiffGradCompiledBindData>(std::move(dummy_lambda), n_numeric_args);
+
+			bind_data->prog.clear();
+			bind_data->prog.reserve(parsed.prog.size());
+			for (auto &sop : parsed.prog) {
+				CompiledOp op;
+				op.op = ConvertStoredOpKind(sop.op);
+				op.a = sop.a;
+				op.b = sop.b;
+				op.cval = sop.cval;
+				op.input_slot = sop.input_slot;
+				bind_data->prog.push_back(op);
+			}
+			bind_data->root = parsed.root;
+
+			ApplyCSE(bind_data->prog, bind_data->root);
+			std::fill(bind_data->input_node.begin(), bind_data->input_node.end(), -1);
+			for (idx_t i = 0; i < bind_data->prog.size(); i++) {
+				if (bind_data->prog[i].op == OpKind::INPUT) {
+					bind_data->input_node[(idx_t)bind_data->prog[i].input_slot] = (int32_t)i;
+				}
+			}
+
+			FinishAutoDiffBindData(*bind_data, n_numeric_args);
+			return std::move(bind_data);
+		}
+		if (last_arg->return_type.id() == LogicalTypeId::STORED_LAMBDA) {
+			// Genuinely dynamic: lambda text isn't known until execution
+			// (column reference, join, or correlated subquery result).
+			auto dummy_lambda = make_uniq<BoundConstantExpression>(Value::DOUBLE(0.0));
+			auto bind_data = make_uniq<AutoDiffGradCompiledBindData>(std::move(dummy_lambda), n_numeric_args);
+			bind_data->is_dynamic_lambda = true;
+			return std::move(bind_data);
+		}
 		auto dummy_lambda = make_uniq<BoundConstantExpression>(Value::DOUBLE(0.0));
 		return make_uniq<AutoDiffGradCompiledBindData>(std::move(dummy_lambda), n_numeric_args);
-	}
+	}	
 
 	auto &ble = last_arg->Cast<BoundLambdaExpression>();
 	const idx_t n_params = ble.parameter_count;
@@ -580,9 +750,7 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 	std::vector<int32_t> input_cache(n_params, -1);
 	bind_data->root = CompileExpr(*bind_data->lambda_expr, n_params, bind_data->prog, input_cache, bind_data->input_node, ble.captures);
 
-	// Apply CSE to reduce tape size
 	ApplyCSE(bind_data->prog, bind_data->root);
-	// Rebuild input_node mapping after CSE remap
 	std::fill(bind_data->input_node.begin(), bind_data->input_node.end(), -1);
 	for (idx_t i = 0; i < bind_data->prog.size(); i++) {
 		if (bind_data->prog[i].op == OpKind::INPUT) {
@@ -590,51 +758,7 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 		}
 	}
 
-	// Build forward SymProg mirroring prog
-	const idx_t prog_size = bind_data->prog.size();
-	SymProg fwd_prog;
-	std::vector<int32_t> fwd_idx(prog_size, -1);
-	for (idx_t i = 0; i < prog_size; i++) {
-		const auto &op = bind_data->prog[i];
-		if      (op.op == OpKind::INPUT) fwd_idx[i] = SymParam(fwd_prog, op.input_slot);
-		else if (op.op == OpKind::CONST) fwd_idx[i] = SymConst(fwd_prog, op.cval);
-		else if (op.op == OpKind::NEG)   fwd_idx[i] = SymNeg(fwd_prog, fwd_idx[(idx_t)op.a]);
-		else if (op.op == OpKind::ADD)   fwd_idx[i] = SymAdd(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
-		else if (op.op == OpKind::SUB)   fwd_idx[i] = SymSub(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
-		else if (op.op == OpKind::MUL)   fwd_idx[i] = SymMul(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
-		else if (op.op == OpKind::DIV)   fwd_idx[i] = SymDiv(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
-		else if (op.op == OpKind::POW)   fwd_idx[i] = SymPow(fwd_prog, fwd_idx[(idx_t)op.a], fwd_idx[(idx_t)op.b]);
-	}
-
-	// Generate symbolic derivative for each parameter
-	bind_data->sym_derivs.resize(n_params);
-	bind_data->sym_roots.resize(n_params, -1);
-	for (idx_t p = 0; p < n_params; p++) {
-		SymProg dp;
-		int32_t dr = SymDiff(bind_data->prog, bind_data->root, (int32_t)p, dp);
-		// dp is self-contained, no fwd_prog needed
-		idx_t offset = fwd_prog.size();
-		for (auto &sn : dp) {
-			if (sn.left  >= 0) sn.left  += (int32_t)offset;
-			if (sn.right >= 0) sn.right += (int32_t)offset;
-			if (sn.child >= 0) sn.child += (int32_t)offset;
-		}
-		dr += (int32_t)offset;
-		dp.insert(dp.begin(), fwd_prog.begin(), fwd_prog.end());
-		bind_data->sym_derivs[p] = std::move(dp);
-		bind_data->sym_roots[p]  = dr;
-	}
-
-#ifdef DUCKDB_HAVE_LLVM
-	// JIT compile tape to native code (forward + backward pass as native code)
-	if (!bind_data->prog.empty()) {
-		bind_data->jit_func = (void*)CompileRevJITBridge(
-			(const void*)&bind_data->prog,
-			(const void*)&bind_data->root,
-			(const void*)&bind_data->input_node,
-			(uint64_t)n_params);
-	}
-#endif
+	FinishAutoDiffBindData(*bind_data, n_params);
 	return std::move(bind_data);
 }
 
@@ -651,6 +775,33 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 
 	RowInput in(args, N);
 
+	if (bind.is_dynamic_lambda) {
+		auto &lambda_vec = args.data.back();
+		lambda_vec.Flatten(count);
+		auto lambda_ptrs = FlatVector::GetData<string_t>(lambda_vec);
+
+		result.SetVectorType(VectorType::FLAT_VECTOR);
+		auto &dyn_children = StructVector::GetEntries(result);
+		for (idx_t j = 0; j < N; j++) {
+			dyn_children[j]->SetVectorType(VectorType::FLAT_VECTOR);
+		}
+		vector<double *> dyn_child_ptrs(N);
+		for (idx_t j = 0; j < N; j++) {
+			dyn_child_ptrs[j] = FlatVector::GetData<double>(*dyn_children[j]);
+		}
+
+		std::vector<double> row_grads(N);
+		for (idx_t r = 0; r < count; r++) {
+			string lambda_text = lambda_ptrs[r].GetString();
+			auto entry = ResolveDynamicLambda(bind, lambda_text, N);
+			RunTapeSingleRow(entry->prog, entry->root, entry->input_node, in, r, N, row_grads.data());
+			for (idx_t j = 0; j < N; j++) {
+				dyn_child_ptrs[j][r] = row_grads[j];
+			}
+		}
+		return;
+	}
+
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &children = StructVector::GetEntries(result);
 	for (idx_t j = 0; j < N; j++) {
@@ -666,7 +817,6 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 	const int32_t root = bind.root;
 
 #ifdef DUCKDB_HAVE_LLVM
-	// JIT path: fastest — direct native code
 	if (bind.jit_func) {
 		auto fn = (RevJitFuncType)bind.jit_func;
 		std::vector<double> inputs(N), grads(N);
@@ -678,9 +828,7 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 		return;
 	}
 #endif
-	// --- Symbolic path: if sym_derivs were generated at bind time, use them ---
 	if (false && !bind.sym_derivs.empty() && (int32_t)bind.sym_derivs.size() == (int32_t)N) {
-		// Pre-allocate scratch buffer — reused across all rows and params
 		idx_t max_sz = 0;
 		for (idx_t j = 0; j < N; j++) if (!bind.sym_derivs[j].empty()) max_sz = std::max(max_sz, (idx_t)bind.sym_derivs[j].size());
 		std::vector<double> scratch(max_sz);
@@ -692,11 +840,6 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 		return;
 	}
 
-	// --- Tape-based path (fallback) ---
-	// Tiled vectorized tape replay.
-	// Working buffers are sized per tile so they fit in L2 cache.
-	// Within each tile, the per-row loop runs the original forward/backward
-	// passes; only the indexing is local to the tile.
 	const idx_t TILE = MYGRAD_REV_TILE_SIZE;
 	std::vector<double> vals(prog.size() * TILE);
 	std::vector<double> adj(prog.size() * TILE);
@@ -704,7 +847,6 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 	for (idx_t tile_start = 0; tile_start < count; tile_start += TILE) {
 		const idx_t tile_count = std::min(TILE, count - tile_start);
 
-		// Phase A: forward pass - for each operation, process all rows in this tile
 		for (idx_t i = 0; i < prog.size(); i++) {
 			const auto &op = prog[i];
 			switch (op.op) {
@@ -738,7 +880,6 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 			}
 		}
 
-		// Phase B: zero adjoints for this tile, seed root for every row in tile
 		for (idx_t i = 0; i < prog.size(); i++) {
 			for (idx_t r = 0; r < tile_count; r++) adj[i * TILE + r] = 0.0;
 		}
@@ -746,7 +887,6 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 			for (idx_t r = 0; r < tile_count; r++) adj[(idx_t)root * TILE + r] = 1.0;
 		}
 
-		// Phase C: backward pass - for each operation in reverse, process all rows in tile
 		for (idx_t ii = prog.size(); ii > 0; ii--) {
 			const idx_t i = ii - 1;
 			const auto &op = prog[i];
@@ -804,7 +944,6 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 			}
 		}
 
-		// Phase D: emit gradients for all rows in tile
 		for (idx_t j = 0; j < N; j++) {
 			const int32_t node = bind.input_node[j];
 			if (node >= 0) {
@@ -832,6 +971,16 @@ void RegisterAutoDiffGradReverse(BuiltinFunctions &set) {
 		fn.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 		fset.AddFunction(std::move(fn));
 	}
+
+	for (idx_t n = 1; n <= 32; n++) {
+		vector<LogicalType> args;
+		for (idx_t i = 0; i < n; i++) args.push_back(LogicalType::ANY);
+		args.push_back(LogicalType(LogicalTypeId::STORED_LAMBDA));
+		ScalarFunction fn(std::move(args), LogicalType::ANY, AutoDiffGradExecute, AutoDiffGradBind);
+		fn.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+		fset.AddFunction(std::move(fn));
+	}
+	
 	set.AddFunction(fset);
 }
 

@@ -111,6 +111,7 @@ PhysicalType LogicalType::GetInternalType() {
 	case LogicalTypeId::CHAR:
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::BIT:
+	case LogicalTypeId::STORED_LAMBDA:
 		return PhysicalType::VARCHAR;
 	case LogicalTypeId::INTERVAL:
 		return PhysicalType::INTERVAL;
@@ -198,6 +199,7 @@ constexpr const LogicalTypeId LogicalType::ROW_TYPE;
 // TODO these are incomplete and should maybe not exist as such
 constexpr const LogicalTypeId LogicalType::TABLE;
 constexpr const LogicalTypeId LogicalType::LAMBDA;
+constexpr const LogicalTypeId LogicalType::STORED_LAMBDA;
 
 constexpr const LogicalTypeId LogicalType::ANY;
 

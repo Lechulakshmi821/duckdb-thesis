@@ -542,6 +542,10 @@ Value Vector::GetValueInternal(const Vector &v_p, idx_t index_p) {
 		auto str = reinterpret_cast<string_t *>(data)[index];
 		return Value(str.GetString());
 	}
+    case LogicalTypeId::STORED_LAMBDA: {
+		auto str = reinterpret_cast<string_t *>(data)[index];
+		return Value::STORED_LAMBDA(str.GetString());
+	}
 	case LogicalTypeId::AGGREGATE_STATE:
 	case LogicalTypeId::BLOB: {
 		auto str = reinterpret_cast<string_t *>(data)[index];

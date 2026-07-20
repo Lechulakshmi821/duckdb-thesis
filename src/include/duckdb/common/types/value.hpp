@@ -170,6 +170,7 @@ public:
 	DUCKDB_API static Value BLOB(const string &data);
 	//! Creates a bitstring by casting a specified string to a bitstring
 	DUCKDB_API static Value BIT(const_data_ptr_t data, idx_t len);
+	DUCKDB_API static Value STORED_LAMBDA(const string &data);
 	DUCKDB_API static Value BIT(const string &data);
 
 	template <class T>

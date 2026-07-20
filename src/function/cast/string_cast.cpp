@@ -386,7 +386,9 @@ BoundCastInfo DefaultCasts::StringCastSwitch(BindCastInput &input, const Logical
 		return BoundCastInfo(&VectorCastHelpers::TryCastStringLoop<string_t, string_t, duckdb::TryCastToBlob>);
 	case LogicalTypeId::BIT:
 		return BoundCastInfo(&VectorCastHelpers::TryCastStringLoop<string_t, string_t, duckdb::TryCastToBit>);
-	case LogicalTypeId::UUID:
+	case LogicalTypeId::STORED_LAMBDA:
+		return &DefaultCasts::ReinterpretCast;
+    case LogicalTypeId::UUID:
 		return BoundCastInfo(&VectorCastHelpers::TryCastStringLoop<string_t, hugeint_t, duckdb::TryCastToUUID>);
 	case LogicalTypeId::SQLNULL:
 		return &DefaultCasts::TryVectorNullCast;

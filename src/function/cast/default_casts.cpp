@@ -125,6 +125,8 @@ BoundCastInfo DefaultCasts::GetDefaultCastFunction(BindCastInput &input, const L
 		return BlobCastSwitch(input, source, target);
 	case LogicalTypeId::BIT:
 		return BitCastSwitch(input, source, target);
+	case LogicalTypeId::STORED_LAMBDA:
+		return &DefaultCasts::ReinterpretCast;
 	case LogicalTypeId::SQLNULL:
 		return NullTypeCast;
 	case LogicalTypeId::MAP:

@@ -769,6 +769,13 @@ Value Value::BIT(const string &data) {
 	return result;
 }
 
+Value Value::STORED_LAMBDA(const string &data) {
+	Value result(LogicalType(LogicalTypeId::STORED_LAMBDA));
+	result.is_null = false;
+	result.value_info_ = make_shared<StringValueInfo>(data);
+	return result;
+}
+
 Value Value::ENUM(uint64_t value, const LogicalType &original_type) {
 	D_ASSERT(original_type.id() == LogicalTypeId::ENUM);
 	Value result(original_type);

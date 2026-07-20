@@ -3067,6 +3067,8 @@ const char* EnumUtil::ToChars<LogicalTypeId>(LogicalTypeId value) {
 		return "AGGREGATE_STATE";
 	case LogicalTypeId::LAMBDA:
 		return "LAMBDA";
+	case LogicalTypeId::STORED_LAMBDA:
+        return "STORED_LAMBDA";
 	case LogicalTypeId::UNION:
 		return "UNION";
 	default:
@@ -3190,6 +3192,9 @@ LogicalTypeId EnumUtil::FromString<LogicalTypeId>(const char *value) {
 	if (StringUtil::Equals(value, "TABLE")) {
 		return LogicalTypeId::TABLE;
 	}
+	if (StringUtil::Equals(value, "STORED_LAMBDA")) {
+        return LogicalTypeId::STORED_LAMBDA;
+    }
 	if (StringUtil::Equals(value, "ENUM")) {
 		return LogicalTypeId::ENUM;
 	}

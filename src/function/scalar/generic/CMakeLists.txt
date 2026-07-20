@@ -12,9 +12,14 @@ add_library_unity(duckdb_func_generic_autodiff_rev OBJECT
     autodiff_reverse.cpp
 )
 
+add_library_unity(duckdb_func_generic_stored_lambda OBJECT
+    autodiff_stored_lambda.cpp
+)
+
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES}
     $<TARGET_OBJECTS:duckdb_func_generic_main>
     $<TARGET_OBJECTS:duckdb_func_generic_autodiff_fwd>
     $<TARGET_OBJECTS:duckdb_func_generic_autodiff_rev>
+    $<TARGET_OBJECTS:duckdb_func_generic_stored_lambda>
     PARENT_SCOPE)

@@ -15,9 +15,11 @@
 #include "duckdb/planner/expression/bound_lambda_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "autodiff_stored_lambda.hpp"
 
 #include <cctype>
 #include <cmath>
+#include <memory>
 #include <vector>
 #include <unordered_map>
 
@@ -60,13 +62,26 @@ struct AutoDiffGradBindData : public FunctionData {
 #ifdef DUCKDB_HAVE_LLVM
 	void* jit_func = nullptr;
 #endif
+	// --- Dynamic (per-row) stored-lambda support ---
+	bool is_dynamic_lambda = false;
+	struct DynamicTapeEntry {
+		std::vector<FwdOp> prog;
+		int32_t root = -1;
+	};
+	mutable std::unordered_map<std::string, std::shared_ptr<DynamicTapeEntry>> dynamic_tape_cache;
 
 	AutoDiffGradBindData(unique_ptr<Expression> expr_p, idx_t nparams_p)
 	    : lambda_expr(std::move(expr_p)), param_cnt(nparams_p) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<AutoDiffGradBindData>(lambda_expr ? lambda_expr->Copy() : nullptr, param_cnt);
+		auto out = make_uniq<AutoDiffGradBindData>(lambda_expr ? lambda_expr->Copy() : nullptr, param_cnt);
+		out->op_cache = op_cache;
+		out->prog = prog;
+		out->root = root;
+		out->is_dynamic_lambda = is_dynamic_lambda;
+		out->dynamic_tape_cache = dynamic_tape_cache;
+		return out;
 	}
 
 	bool Equals(const FunctionData &) const override {
@@ -203,7 +218,7 @@ static bool NameToSlot(const string &raw_in, idx_t param_cnt, idx_t &slot_out) {
         if (s == "y") { slot_out = 3; return true; }
     }
 
-	
+
 	// Backward-compatible mapping for <= 3 params
    if (param_cnt <= 3) {
        if (s == "u" || s == "x" || s == "a") { slot_out = 0; return true; }
@@ -211,7 +226,7 @@ static bool NameToSlot(const string &raw_in, idx_t param_cnt, idx_t &slot_out) {
        if (s == "w" || s == "z" || s == "c") { slot_out = 2; return true; }
     }
 
-	
+
 	idx_t pos = 0;
 	while (pos < s.size() && !std::isdigit((unsigned char)s[pos])) {
 		pos++;
@@ -383,7 +398,7 @@ static Dual EvalExpr(Expression &expr, const RowInput &in, idx_t row, const Auto
 	}
 
 	case ExpressionClass::BOUND_COLUMN_REF: {
-	
+
 		auto &c = expr.Cast<BoundColumnRefExpression>();
 		idx_t slot = c.binding.column_index;
 
@@ -395,13 +410,13 @@ static Dual EvalExpr(Expression &expr, const RowInput &in, idx_t row, const Auto
 	}
 
 	case ExpressionClass::BOUND_REF: {
-		
+
 		string nm = expr.alias;
 		if (nm.empty()) nm = expr.ToString();
 
 		idx_t slot;
 		if (!NameToSlot(nm, N, slot)) {
-			
+
 			return MakeConst(0.0, N);
 		}
 
@@ -475,6 +490,117 @@ static Dual EvalExpr(Expression &expr, const RowInput &in, idx_t row, const Auto
 }
 
 // ============================================================================
+// Dynamic (per-row) stored-lambda support: converter + cache resolver + single-row runner
+// ============================================================================
+static FwdOpKind ConvertStoredOpKindToFwd(StoredOpKind k) {
+	switch (k) {
+	case StoredOpKind::INPUT: return FwdOpKind::INPUT;
+	case StoredOpKind::CONST: return FwdOpKind::CONST;
+	case StoredOpKind::NEG:   return FwdOpKind::NEG;
+	case StoredOpKind::ADD:   return FwdOpKind::ADD;
+	case StoredOpKind::SUB:   return FwdOpKind::SUB;
+	case StoredOpKind::MUL:   return FwdOpKind::MUL;
+	case StoredOpKind::DIV:   return FwdOpKind::DIV;
+	case StoredOpKind::POW:   return FwdOpKind::POW;
+	}
+	throw InternalException("stored lambda (fwd): unknown op kind");
+}
+
+static std::shared_ptr<AutoDiffGradBindData::DynamicTapeEntry>
+ResolveDynamicLambdaFwd(AutoDiffGradBindData &bind, const string &lambda_text, idx_t n_numeric_args) {
+	auto it = bind.dynamic_tape_cache.find(lambda_text);
+	if (it != bind.dynamic_tape_cache.end()) {
+		return it->second;
+	}
+	auto parsed = CompileStoredLambda(lambda_text);
+	if (parsed.n_params != n_numeric_args) {
+		throw InvalidInputException("mygrad_fwd: stored lambda has " + std::to_string(parsed.n_params) +
+		                             " parameters but " + std::to_string(n_numeric_args) + " numeric args given");
+	}
+	auto entry = std::make_shared<AutoDiffGradBindData::DynamicTapeEntry>();
+	entry->prog.reserve(parsed.prog.size());
+	for (auto &sop : parsed.prog) {
+		FwdOp op;
+		op.op = ConvertStoredOpKindToFwd(sop.op);
+		op.a = sop.a;
+		op.b = sop.b;
+		op.cval = sop.cval;
+		op.input_slot = sop.input_slot;
+		entry->prog.push_back(op);
+	}
+	entry->root = parsed.root;
+	bind.dynamic_tape_cache[lambda_text] = entry;
+	return entry;
+}
+
+// Evaluates one row via dual-number forward propagation over a resolved tape.
+static void RunFwdTapeSingleRow(const std::vector<FwdOp> &prog, int32_t root,
+                                const RowInput &in, idx_t row, idx_t N,
+                                double *out_grads) {
+	if (root < 0 || prog.empty()) {
+		for (idx_t j = 0; j < N; j++) out_grads[j] = 0.0;
+		return;
+	}
+	const idx_t sz = (idx_t)root + 1;
+	std::vector<double> val(sz);
+	std::vector<double> grad(sz * N);
+
+	for (idx_t i = 0; i < sz; i++) {
+		const auto &op = prog[i];
+		switch (op.op) {
+		case FwdOpKind::INPUT:
+			val[i] = in.Get((idx_t)op.input_slot, row);
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = (j == (idx_t)op.input_slot) ? 1.0 : 0.0;
+			break;
+		case FwdOpKind::CONST:
+			val[i] = op.cval;
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = 0.0;
+			break;
+		case FwdOpKind::NEG:
+			val[i] = -val[(idx_t)op.a];
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = -grad[(idx_t)op.a*N+j];
+			break;
+		case FwdOpKind::ADD:
+			val[i] = val[(idx_t)op.a] + val[(idx_t)op.b];
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = grad[(idx_t)op.a*N+j] + grad[(idx_t)op.b*N+j];
+			break;
+		case FwdOpKind::SUB:
+			val[i] = val[(idx_t)op.a] - val[(idx_t)op.b];
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = grad[(idx_t)op.a*N+j] - grad[(idx_t)op.b*N+j];
+			break;
+		case FwdOpKind::MUL: {
+			double lv = val[(idx_t)op.a], rv = val[(idx_t)op.b];
+			val[i] = lv * rv;
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = grad[(idx_t)op.a*N+j]*rv + grad[(idx_t)op.b*N+j]*lv;
+			break;
+		}
+		case FwdOpKind::DIV: {
+			double lv = val[(idx_t)op.a], rv = val[(idx_t)op.b];
+			val[i] = lv / rv;
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = (grad[(idx_t)op.a*N+j]*rv - grad[(idx_t)op.b*N+j]*lv) / (rv*rv);
+			break;
+		}
+		case FwdOpKind::POW: {
+			double lv = val[(idx_t)op.a], rv = val[(idx_t)op.b];
+			val[i] = std::pow(lv, rv);
+			for (idx_t j = 0; j < N; j++) {
+				double dl = grad[(idx_t)op.a*N+j], dr = grad[(idx_t)op.b*N+j];
+				double term1 = (lv != 0.0) ? rv * std::pow(lv, rv - 1.0) * dl : 0.0;
+				double term2 = (lv > 0.0) ? std::pow(lv, rv) * std::log(lv) * dr : 0.0;
+				grad[i*N+j] = term1 + term2;
+			}
+			break;
+		}
+		default:
+			val[i] = 0.0;
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = 0.0;
+			break;
+		}
+	}
+	for (idx_t j = 0; j < N; j++) out_grads[j] = grad[(idx_t)root*N+j];
+}
+
+// ============================================================================
 // Bind: validate, build STRUCT(d1..dN), keep a COPY of lambda expr
 // ============================================================================
 static unique_ptr<FunctionData>
@@ -490,7 +616,7 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 	}
 
 
-	
+
 	child_list_t<LogicalType> kids;
 	for (idx_t i = 0; i < n_numeric_args; i++) {
 		kids.push_back({string("d") + std::to_string(i + 1), LogicalType::DOUBLE});
@@ -499,8 +625,47 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 
 	auto *last = arguments.back().get();
 
-	
+
 	if (last->expression_class != ExpressionClass::BOUND_LAMBDA) {
+		Expression *unwrapped = last;
+		while (unwrapped->expression_class == ExpressionClass::BOUND_CAST) {
+			unwrapped = unwrapped->Cast<BoundCastExpression>().child.get();
+		}
+		if (last->return_type.id() == LogicalTypeId::STORED_LAMBDA &&
+		    unwrapped->expression_class == ExpressionClass::BOUND_CONSTANT) {
+			auto &c = unwrapped->Cast<BoundConstantExpression>();
+			string lambda_text = StringValue::Get(c.value);
+			auto parsed = CompileStoredLambda(lambda_text);
+			if (parsed.n_params != n_numeric_args) {
+				throw BinderException("mygrad_fwd: stored lambda has " + std::to_string(parsed.n_params) +
+				                       " parameters but " + std::to_string(n_numeric_args) + " numeric args given");
+			}
+			auto dummy = make_uniq<BoundConstantExpression>(Value::DOUBLE(0.0));
+			auto bind_data = make_uniq<AutoDiffGradBindData>(std::move(dummy), n_numeric_args);
+
+			bind_data->prog.clear();
+			bind_data->prog.reserve(parsed.prog.size());
+			for (auto &sop : parsed.prog) {
+				FwdOp op;
+				op.op = ConvertStoredOpKindToFwd(sop.op);
+				op.a = sop.a;
+				op.b = sop.b;
+				op.cval = sop.cval;
+				op.input_slot = sop.input_slot;
+				bind_data->prog.push_back(op);
+			}
+			bind_data->root = parsed.root;
+#ifdef DUCKDB_HAVE_LLVM
+			bind_data->jit_func = (void*)CompileJITBridge((const void*)&bind_data->prog, bind_data->root, (uint64_t)n_numeric_args);
+#endif
+			return std::move(bind_data);
+		}
+		if (last->return_type.id() == LogicalTypeId::STORED_LAMBDA) {
+			auto dummy = make_uniq<BoundConstantExpression>(Value::DOUBLE(0.0));
+			auto bind_data = make_uniq<AutoDiffGradBindData>(std::move(dummy), n_numeric_args);
+			bind_data->is_dynamic_lambda = true;
+			return std::move(bind_data);
+		}
 		auto dummy = make_uniq<BoundConstantExpression>(Value::DOUBLE(0.0));
 		return make_uniq<AutoDiffGradBindData>(std::move(dummy), n_numeric_args);
 	}
@@ -511,15 +676,15 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 	if (n_params == 0) throw BinderException("mygrad: lambda must have at least 1 parameter");
 	if (n_params != n_numeric_args) throw BinderException("mygrad: lambda parameter count must match #numeric args");
 
-	
+
 	if (!ble.captures.empty()) {
 		throw BinderException("mygrad: captures not supported. Pass constants as explicit parameters");
 	}
 
-	
+
 	auto lambda_expr = ble.lambda_expr->Copy();
 
-	
+
 	for (idx_t i = 0; i < n_numeric_args; i++) {
 		if (arguments[i]->return_type.id() != LogicalTypeId::DOUBLE) {
 			throw BinderException("mygrad: numeric args must be DOUBLE (use ::DOUBLE)");
@@ -571,6 +736,27 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 	if (count == 0) return;
 
 	RowInput in(args, N);
+
+	if (bind.is_dynamic_lambda) {
+		auto &lambda_vec = args.data.back();
+		lambda_vec.Flatten(count);
+		auto lambda_ptrs = FlatVector::GetData<string_t>(lambda_vec);
+
+		result.SetVectorType(VectorType::FLAT_VECTOR);
+		auto &dyn_children = StructVector::GetEntries(result);
+		for (idx_t j = 0; j < N; j++) dyn_children[j]->SetVectorType(VectorType::FLAT_VECTOR);
+		vector<double *> dyn_ptr(N);
+		for (idx_t j = 0; j < N; j++) dyn_ptr[j] = FlatVector::GetData<double>(*dyn_children[j]);
+
+		std::vector<double> row_grads(N);
+		for (idx_t r = 0; r < count; r++) {
+			string lambda_text = lambda_ptrs[r].GetString();
+			auto entry = ResolveDynamicLambdaFwd(bind, lambda_text, N);
+			RunFwdTapeSingleRow(entry->prog, entry->root, in, r, N, row_grads.data());
+			for (idx_t j = 0; j < N; j++) dyn_ptr[j][r] = row_grads[j];
+		}
+		return;
+	}
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &children = StructVector::GetEntries(result);
@@ -697,12 +883,20 @@ void RegisterAutoDiffGrad(BuiltinFunctions &set) {
 		Printer::Print("[mygrad] registering forward-mode AD function");
 	}
 
-	ScalarFunctionSet fset("mygrad_fwd"); 
+	ScalarFunctionSet fset("mygrad_fwd");
 	for (idx_t n = 1; n <= 32; n++) {
 		vector<LogicalType> args;
 		for (idx_t i = 0; i < n; i++) args.push_back(LogicalType::ANY);
 		args.push_back(LogicalType::LAMBDA);
 
+		ScalarFunction fn(std::move(args), LogicalType::ANY, AutoDiffGradExecute, AutoDiffGradBind);
+		fn.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+		fset.AddFunction(std::move(fn));
+	}
+	for (idx_t n = 1; n <= 32; n++) {
+		vector<LogicalType> args;
+		for (idx_t i = 0; i < n; i++) args.push_back(LogicalType::ANY);
+		args.push_back(LogicalType(LogicalTypeId::STORED_LAMBDA));
 		ScalarFunction fn(std::move(args), LogicalType::ANY, AutoDiffGradExecute, AutoDiffGradBind);
 		fn.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 		fset.AddFunction(std::move(fn));
