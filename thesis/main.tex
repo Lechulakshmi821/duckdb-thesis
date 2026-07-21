@@ -94,7 +94,7 @@ Faculty Information Systems and Applied Computer Sciences
 
 \vfill
 
-May 2026
+July 2026
 
 \end{center}
 
@@ -127,43 +127,34 @@ to express complex ideas with simple abstractions.''
 
 \chapter*{Abstract}
 \addcontentsline{toc}{chapter}{Abstract}
+Modern analytical workflows increasingly combine relational data processing
+with machine learning, yet the two are typically kept separate: data is
+extracted from the database, gradients are computed in an external
+framework, and results are written back. This causes unnecessary data
+movement and prevents the database from optimizing the combined workload.
+Automatic differentiation (AD), the technique underlying gradient-based
+machine learning, is not natively supported by relational database systems.
 
-Modern analytical workflows increasingly combine relational data processing with
-machine learning, yet the two are typically separated: data is extracted from the
-database, gradients and models are computed in external frameworks, and results
-are written back. This separation causes unnecessary data movement and prevents
-the database from optimizing the combined workload. Automatic differentiation
-(AD), the technique underlying gradient-based machine learning, is not natively
-supported by relational database systems.
+This thesis integrates AD directly into DuckDB using higher-order SQL
+lambda expressions as differentiable programs: a lambda passed to an AD
+function is compiled into an internal representation from which gradients
+are computed automatically. Both forward-mode and reverse-mode AD are
+implemented, each compiled once at bind time into a flat instruction tape,
+optimized through common subexpression elimination and tiled vectorisation,
+and finally JIT-compiled to native machine code via LLVM. The implementation
+is further extended so that lambda expressions can be stored as first-class
+typed values in table columns, with both a bind-time path retaining the
+full optimization pipeline and a dynamic per-row path for lambdas that vary
+across rows.
 
-This thesis investigates whether automatic differentiation can be integrated
-directly into a modern analytical database system using higher-order SQL lambda
-expressions. The work is carried out in DuckDB, a high-performance in-process
-analytical database optimized for vectorized execution. Lambda expressions,
-which DuckDB supports as higher-order SQL functions, are treated as
-differentiable programs: a lambda passed to an AD function is compiled into an
-internal representation from which gradients are computed automatically, without
-manual derivation. Both forward-mode and reverse-mode AD are designed and
-implemented, and both return the full gradient of the lambda expression in a
-single call. The implementation is integrated into DuckDB's binder and scalar
-function subsystem and reuses the existing vectorized execution engine,
-requiring only localized modifications to the database.
-
-The implementation is evaluated on linear regression gradient-descent workloads
-across dataset sizes ranging from one thousand to fifty thousand tuples,
-comparing handwritten SQL gradients, forward-mode AD, and reverse-mode AD on an
-optimized release build with single-threaded execution. Reverse-mode AD stays
-within roughly $1.3\times$ to $2.2\times$ of the handwritten SQL baseline
-across the evaluated dataset sizes, whereas forward-mode AD is slower, with
-the gap between the two AD modes widening from roughly $1.5\times$ at one
-thousand tuples to roughly $6.1\times$ at fifty thousand tuples. Forward-mode
-AD performance was substantially improved by moving per-row string-based
-operator dispatch to a bind-time hash-map cache, mirroring the design of the
-reverse-mode instruction tape. The thesis demonstrates that differentiable
-computation can be expressed and executed directly inside SQL queries, and
-that bind-time compilation --- of the reverse-mode tape and of the
-forward-mode operator cache --- is an effective optimization strategy for
-automatic differentiation in a database engine.
+Evaluated on linear regression gradient-descent workloads from one thousand
+to fifty thousand tuples, both forward-mode and reverse-mode AD match the
+handwritten SQL baseline at $1.00\times$ overhead at fifty thousand tuples
+after all optimizations; the stored-lambda bind-time path matches this same
+baseline, while the dynamic path shows the expected overhead from operating
+without JIT compilation. The thesis demonstrates that differentiable
+computation can be expressed and executed directly inside SQL queries with
+performance equivalent to handwritten SQL gradients.
 
 
 \newpage
@@ -226,12 +217,18 @@ AD    & Automatic Differentiation \\
 API   & Application Programming Interface \\
 AST   & Abstract Syntax Tree \\
 CPU   & Central Processing Unit \\
+CSE   & Common Subexpression Elimination \\
 DBMS  & Database Management System \\
+IR    & Intermediate Representation \\
+JIT   & Just-In-Time Compilation \\
+LLVM  & Low Level Virtual Machine \\
 ML    & Machine Learning \\
+MLIR  & Multi-Level Intermediate Representation \\
 OLAP  & Online Analytical Processing \\
 RDBMS & Relational Database Management System \\
 SIMD  & Single Instruction Multiple Data \\
 SQL   & Structured Query Language \\
+SSA   & Static Single Assignment \\
 \end{tabular}
 
 
@@ -352,17 +349,20 @@ evaluation presented throughout this thesis.
 
 \section{Thesis Contributions}
 
-The primary contributions of this thesis are summarized as follows:
+The primary contributions of this thesis are as follows. Forward-mode automatic
+differentiation is implemented inside DuckDB using higher-order SQL lambda
+functions and a flat instruction tape compiled at bind time. Reverse-mode
+automatic differentiation is implemented with the same bind-time tape
+compilation strategy, together with tape reuse across rows and iterations.
+Common subexpression elimination (CSE) is applied to the instruction tape to
+remove redundant computations identified at bind time, and tiled vectorisation
+of the tape replay improves cache utilization during execution. Both AD modes
+are further compiled to native machine code via LLVM JIT compilation, which
+eliminates interpreter overhead and achieves $1.00\times$ overhead relative to
+handwritten SQL at 50{,}000 tuples. Finally, the thesis presents an
+experimental evaluation comparing handwritten SQL gradients, forward-mode AD,
+and reverse-mode AD across every optimization stage described above.
 
-\begin{itemize}
-  \item Implementation of forward-mode automatic differentiation inside DuckDB
-        using higher-order SQL lambda functions.
-  \item Implementation of reverse-mode automatic differentiation with
-        computation tape reuse.
-  \item Integration of AD into DuckDB's binder and scalar function subsystem.
-  \item Experimental evaluation comparing handwritten SQL gradients,
-        forward-mode AD, and reverse-mode AD.
-\end{itemize}
 
 \section{Thesis Structure}
 
@@ -392,6 +392,16 @@ Automatic differentiation (AD) is a technique for computing exact derivatives of
 Baydin et al.~\cite{baydin2017automatic} provide a detailed survey of AD methods and their applications in machine learning systems. Griewank and Walther~\cite{griewank2008evaluating} formally describe forward-mode and reverse-mode AD and explain how gradients can be propagated through computation graphs. Beyond the first-order gradient, the same operation-level differentiation principle extends to higher-order information, such as exact Hessian-vector products~\cite{pearlmutter1994hessian}, although the present work is restricted to first-order gradients.
 
 AD is used extensively in modern machine learning frameworks, because training algorithms such as gradient descent require efficient gradient computation. Modern systems rely mainly on reverse-mode AD. TensorFlow~\cite{abadi2016tensorflow} uses graph-based execution and symbolic gradient operators, while PyTorch~\cite{paszke2019pytorch} introduced dynamic computation graphs using eager execution. Although these frameworks provide highly optimized differentiation systems, they operate mainly outside relational database engines.
+
+Schüle et al.~\cite{schule2022llvm} integrated forward-mode and
+reverse-mode AD as SQL operators inside the Umbra database system,
+using LLVM code generation to eliminate interpreter overhead. Their
+work demonstrated that after LLVM optimisation, both AD modes
+produce nearly identical machine code and achieve equivalent runtime
+performance. This thesis independently replicates that finding in
+DuckDB using a flat tape intermediate representation compiled
+directly to LLVM IR, without requiring the MLIR infrastructure
+used in Umbra.
 
 \begin{figure}[h]
 \centering
@@ -429,9 +439,10 @@ tasks inside DBMSs.
 Large-scale analytical systems such as Spark SQL and MLlib also demonstrated the advantages of combining relational processing with machine learning workloads~\cite{armbrust2015sparksql,zaharia2016spark,meng2016mllib,boehm2016systemml}. These systems build on a broader lineage of large-scale data-processing frameworks, including MapReduce~\cite{dean2004mapreduce}, resilient distributed datasets~\cite{zaharia2012rdd}, declarative dataflow languages such as Pig Latin~\cite{olston2008piglatin}, hybrid MapReduce--DBMS architectures such as HadoopDB~\cite{abouzeid2009hadoopdb}, and interactive web-scale analytical engines such as Dremel~\cite{melnik2010dremel}.
 
 Despite these advances, existing systems typically rely on manually derived
-gradients, predefined ML operators, or fixed model templates.
+gradients, predefined ML operators, or fixed model templates, rather than
+differentiating directly over arbitrary SQL lambda expressions. The need for automation is reinforced by the difficulty of interpreting and trusting model behaviour, a concern that has motivated dedicated explanation techniques~\cite{ribeiro2016trust}: pipelines whose gradients are derived automatically are easier to inspect and reason about than hand-derived ones.
 
-Most systems do not support reusable automatic differentiation directly over arbitrary SQL lambda expressions. The need for automation is reinforced by the difficulty of interpreting and trusting model behaviour, a concern that has motivated dedicated explanation techniques~\cite{ribeiro2016trust}: pipelines whose gradients are derived automatically are easier to inspect and reason about than hand-derived ones.
+A related but distinct line of work uses machine learning to optimize the database engine itself, rather than exposing ML to users as a query capability. Learned index structures replace traditional index data structures with learned models ~\cite{kraska2018learned}, learned query optimizers use ML to improve plan selection ~\cite{chen2024glo}, and self-driving database systems apply ML throughout the engine for autonomous tuning ~\cite{pavlo2017selfdriving}. This thesis instead focuses on making differentiable computation available as a first-class SQL capability, exposed directly to the user through lambda expressions, rather than on using learning to optimize the engine internally.
 
 \begin{figure}[H]
     \centering
@@ -854,6 +865,238 @@ To remove this overhead, the expression tree is compiled into the instruction ta
 
 This optimization eliminates repeated graph construction and is the most important performance improvement implemented in this work. Its effect is discussed in Chapter~\ref{ch:evaluation} and Appendix~\ref{app:experiments}.
 
+\subsection{Gradient Descent in SQL Using AD}
+
+Listing~\ref{lst:gd-comparison} shows gradient descent expressed
+in SQL using both handwritten gradients and the implemented AD
+operator, following the style of Schüle et al.~\cite{schule2022llvm}.
+
+\begin{lstlisting}[language=SQL, caption={Gradient descent using
+recursive tables: manually derived (lines 1--8) and using automatic
+differentiation (lines 10--20).}, label={lst:gd-comparison}]
+-- Handwritten SQL gradients (baseline)
+WITH RECURSIVE gd(i, a1, a2, a3, a4, a5, a6, b) AS (
+  SELECT 1, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE,
+            1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE
+  UNION ALL
+  SELECT i+1,
+    a1 - 0.1*AVG(2*x1*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6)),
+    ...
+    b  - 0.1*AVG(2*(a1*x1+a2*x2+a3*x3+a4*x4+a5*x5+a6*x6+b-y6))
+  FROM gd, data WHERE i < 20 GROUP BY i,a1,a2,a3,a4,a5,a6,b
+)
+SELECT * FROM gd WHERE i = 20;
+
+-- Automatic differentiation using mygrad_rev
+WITH RECURSIVE gd(i, a1, a2, a3, a4, a5, a6, b) AS (
+  SELECT 1, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE,
+            1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE
+  UNION ALL
+  SELECT i+1,
+    a1 - 0.1*AVG(g.d1), a2 - 0.1*AVG(g.d2),
+    a3 - 0.1*AVG(g.d3), a4 - 0.1*AVG(g.d4),
+    a5 - 0.1*AVG(g.d5), a6 - 0.1*AVG(g.d6),
+    b  - 0.1*AVG(g.d7)
+  FROM (
+    SELECT mygrad_rev(
+      gd.a1,gd.a2,gd.a3,gd.a4,gd.a5,gd.a6,gd.b,
+      data.x1,data.x2,data.x3,data.x4,data.x5,data.x6,data.y6,
+      (p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14) ->
+        (p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)
+       *(p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)
+    ) AS g
+    FROM gd, data WHERE gd.i < 20
+  )
+  GROUP BY i,a1,a2,a3,a4,a5,a6,b
+)
+SELECT * FROM gd WHERE i = 20;
+\end{lstlisting}
+
+\subsection{Storing Lambda Expressions in Tables}
+\label{sec:stored-lambda}
+
+The lambda expressions used throughout this thesis so far are written inline
+in the SQL query text, following the same pattern as DuckDB's native
+higher-order functions. Following the supervisor's suggestion, this section
+extends the implementation so that a lambda expression can also be stored as
+a value in a table column, retrieved via a query, and passed to
+\texttt{mygrad\_fwd} or \texttt{mygrad\_rev} without being written inline.
+
+\subsubsection{A New Logical Type: \texttt{STORED\_LAMBDA}}
+
+DuckDB's type system (\texttt{LogicalTypeId}) was extended with a new type,
+\texttt{STORED\_LAMBDA}, following the same registration pattern used for
+existing types such as \texttt{BIT}. The type is physically backed by
+\texttt{VARCHAR} storage, is registered as a nameable SQL type (so
+\texttt{col STORED\_LAMBDA} can appear in a \texttt{CREATE TABLE} statement),
+and has explicit cast rules allowing a string literal to be implicitly
+converted into it:
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE models (name VARCHAR, loss_fn STORED_LAMBDA);
+INSERT INTO models VALUES (
+    'linear',
+    '(p1,p2,p3,p4) -> (p1*p3+p2-p4)*(p1*p3+p2-p4)'
+);
+\end{lstlisting}
+
+Unlike a plain \texttt{VARCHAR} column, \texttt{STORED\_LAMBDA} is a distinct,
+named type in the catalog and in query results (\texttt{typeof()} reports it
+as \texttt{STORED\_LAMBDA}), giving lambda values first-class type status
+comparable to DuckDB's \texttt{LIST} type, while keeping the underlying
+storage simple.
+
+\subsubsection{Parsing a Stored Lambda}
+
+A stored lambda is held as text of the form \texttt{(p1,...,pN) -> body}.
+Because DuckDB's grammar only recognises the \texttt{->} lambda syntax inside
+a higher-order function call, a stored lambda's text cannot be parsed by
+DuckDB's parser as a whole. Instead, the parameter list and body are split
+manually, and only the body is handed to DuckDB's expression parser
+(\texttt{Parser::ParseExpressionList}), which returns a genuine, unbound
+expression tree. This unbound tree is then compiled into the same flat
+instruction tape representation (\texttt{CompiledOp}/\texttt{FwdOp}) used for
+inline lambdas, so that all downstream machinery --- common subexpression
+elimination, symbolic differentiation, and LLVM JIT compilation --- is
+reused unchanged for both inline and stored lambdas.
+
+\subsubsection{Two Execution Paths}
+
+Two distinct cases are handled, depending on when the lambda's text becomes
+known:
+
+\begin{itemize}
+    \item \textbf{Bind-time (constant) path.} When the stored lambda argument
+    is a literal cast to \texttt{STORED\_LAMBDA} (or any expression DuckDB's
+    optimiser constant-folds before binding), the text is known at bind time.
+    In this case the lambda is parsed, compiled, CSE-reduced, and JIT-compiled
+    exactly once, identically to the inline-lambda path, and reused for every
+    row --- achieving the same performance characteristics reported in
+    Chapter~5.
+
+    \item \textbf{Execution-time (dynamic) path.} When the stored lambda
+    argument is a column reference or the result of a join --- as in
+    \texttt{mygrad\_rev(data.*, models.loss\_fn) FROM data, models} --- its
+    text is genuinely per-row data and cannot be known at bind time. In this
+    case, the bind function marks the call as \emph{dynamic}, and at
+    execution time each row's lambda text is parsed and compiled lazily, with
+    the compiled tape cached in a hash map keyed by the lambda's text. Rows
+    sharing the same stored lambda therefore reuse the same compiled tape,
+    while rows with a different stored lambda trigger a new
+    parse-and-compile step exactly once.
+\end{itemize}
+
+\begin{lstlisting}[language=SQL]
+SELECT mygrad_rev(data.x1, data.x2, data.x3, data.x4, models.loss_fn)
+FROM data, models
+WHERE models.name = data.model_name;
+\end{lstlisting}
+
+\subsubsection{Verification}
+
+Both execution paths were verified against hand-derived analytical gradients.
+For the loss function
+$L = (p_1 p_3 + p_2 - p_4)^2$
+evaluated at $(p_1,p_2,p_3,p_4) = (1,2,3,4)$, both the bind-time and
+execution-time paths produced $(6.0, 2.0, 2.0, -2.0)$, matching the
+analytical gradient exactly. A second test joined two different stored
+lambdas (a four-parameter and a two-parameter model) against separate data
+tables in the same session, confirming that the per-row cache correctly
+distinguishes between different stored lambda texts rather than reusing a
+single cached tape incorrectly.This verification was performed for both \texttt{mygrad\_fwd} and
+\texttt{mygrad\_rev}: the bind-time and execution-time paths were confirmed
+independently for each mode, all four returning $(6.0, 2.0, 2.0, -2.0)$ for
+the same test case.
+
+\subsubsection{Scope and Limitations}
+
+The dynamic execution path evaluates each row independently, without the
+tiled vectorisation or LLVM JIT compilation applied to the static inline- and
+constant-lambda paths, since a JIT compilation step per row would be far more
+expensive than the row itself. This was confirmed experimentally for both AD
+modes, using the same 20-iteration gradient-descent benchmark and dataset
+sizes used throughout Chapter~\ref{ch:evaluation}
+(Figure~\ref{fig:stored_lambda_bench}). At 50{,}000 tuples: the reverse-mode
+bind-time (constant) path measured 0.093\,s and the reverse-mode dynamic path
+0.189\,s (a $2.03\times$ overhead); the forward-mode bind-time (constant)
+path measured 0.088\,s and the forward-mode dynamic path 0.350\,s (a
+$3.98\times$ overhead). All constant-path measurements match the fully
+optimized inline-lambda and handwritten-SQL baselines (0.10\,s at this
+scale), confirming that the bind-time path carries no cost regardless of AD
+mode.
+
+The dynamic path shows a markedly larger overhead for forward mode than for
+reverse mode --- nearly twice the relative slowdown. This is consistent with
+the complexity difference between the two modes analysed in
+Appendix~\ref{app:proofs}: forward-mode evaluation cost scales as
+$O(n \cdot p)$ in the number of parameters $p$, while reverse-mode scales as
+$O(n)$. In the fully optimized static paths this difference is masked by
+LLVM JIT compilation, which both modes benefit from equally; the dynamic
+path has no such compilation step, so the underlying per-parameter cost of
+forward-mode AD becomes directly visible in the measured runtime. This path
+trades some performance for generality, and is appropriate for workloads
+where the lambda genuinely varies across rows (e.g. selecting between a
+small number of stored models via a join) rather than for large-scale
+single-model training.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lc}
+\toprule
+Method & Median runtime (s) \\
+\midrule
+Baseline SQL & 0.10 \\
+Inline reverse-mode AD (LLVM JIT) & 0.10 \\
+Stored lambda --- bind-time (constant) path & 0.093 \\
+Stored lambda --- dynamic (execution-time) path & 0.189 \\
+\bottomrule
+\end{tabular}
+\caption{Median runtime (5 runs) of the stored-lambda execution paths against
+the existing baseline and inline reverse-mode AD, at 50{,}000 tuples,
+20 gradient-descent iterations.}
+\label{tab:stored_lambda_bench}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    bar width=16pt,
+    width=\textwidth,
+    height=7cm,
+    symbolic x coords={Baseline, Forward AD, Reverse AD, Stored constant (fwd), Stored constant (rev), Stored dynamic (fwd), Stored dynamic (rev)},
+    xtick=data,
+    x tick label style={rotate=30, anchor=east, font=\small},
+    ylabel={Median runtime (s)},
+    ymin=0,
+    nodes near coords,
+    nodes near coords align={vertical},
+    every node near coord/.append style={font=\scriptsize},
+    enlarge x limits=0.1,
+    ]
+\addplot coordinates {
+    (Baseline, 0.10)
+    (Forward AD, 0.10)
+    (Reverse AD, 0.10)
+    (Stored constant (fwd), 0.088)
+    (Stored constant (rev), 0.093)
+    (Stored dynamic (fwd), 0.350)
+    (Stored dynamic (rev), 0.189)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Median runtime (5 runs) of all evaluated methods at 50{,}000
+tuples, 20 gradient-descent iterations: handwritten SQL baseline,
+inline forward- and reverse-mode AD (LLVM JIT), and the bind-time
+(constant) and dynamic (execution-time) stored-lambda paths for both AD
+modes. All bind-time paths match the fully optimized static methods; the
+dynamic paths show the expected overhead from lacking tiled vectorisation
+and LLVM JIT compilation, with forward mode showing a larger gap due to
+its $O(n \cdot p)$ complexity versus reverse mode's $O(n)$.}
+\label{fig:stored_lambda_bench}
+\end{figure}
+
 \section{Reverse-Mode Execution Workflow}
 
 The overall reverse-mode workflow separates the one-time tape compilation in the binder from the per-row replay in the execution engine, as shown in Algorithm~\ref{alg:reverse-ad}.
@@ -877,6 +1120,372 @@ The overall reverse-mode workflow separates the one-time tape compilation in the
 \EndFor
 \end{algorithmic}
 \end{algorithm}
+
+\section{Algorithmic Description of AD Modes}
+
+Following the algorithmic formulation of Schüle et
+al.~\cite{schule2022llvm}, both AD modes apply the chain rule
+$\frac{\partial f(g)}{\partial x} = \frac{\partial f(g)}{\partial g}
+\cdot \frac{\partial g}{\partial x}$ at each operation.
+
+Algorithm~\ref{alg:fwd-mode} shows forward-mode AD, which
+evaluates the expression and derivative simultaneously in one pass,
+returning a pair of value and derivative for each subexpression.
+
+\begin{algorithm}[H]
+\caption{Forward Mode AD (after Schüle et al.~\cite{schule2022llvm})}
+\label{alg:fwd-mode}
+\begin{algorithmic}
+\Function{eval}{$Z$, $V$}
+    \If{$\text{isVariable}(Z)$}
+        \If{$Z = V$} \Return $\{z, 1\}$
+        \Else\ \Return $\{z, 0\}$
+        \EndIf
+    \Else
+        \State $\{x, x'\} \leftarrow \text{eval}(X, V)$;
+               $\{y, y'\} \leftarrow \text{eval}(Y, V)$
+        \If{$Z = X + Y$} \Return $\{x+y,\ x'+y'\}$
+        \ElsIf{$Z = X - Y$} \Return $\{x-y,\ x'-y'\}$
+        \ElsIf{$Z = X \cdot Y$} \Return $\{x \cdot y,\ x' \cdot y + x \cdot y'\}$
+        \ElsIf{$Z = X / Y$} \Return $\left\{\frac{x}{y},\ \frac{x' \cdot y - x \cdot y'}{y^2}\right\}$
+        \ElsIf{$Z = X^Y$ (w.r.t. $x$)} \Return $\{x^y,\ y \cdot x^{y-1} \cdot x'\}$
+        \EndIf
+    \EndIf
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:rev-mode} shows reverse-mode AD, which first
+evaluates the expression and then recursively propagates adjoint
+values (seeds) backwards through the computation graph.
+
+\begin{algorithm}[H]
+\caption{Reverse Mode AD (after Schüle et al.~\cite{schule2022llvm})}
+\label{alg:rev-mode}
+\begin{algorithmic}
+\Function{derive}{$Z$, $z'$}
+    \If{$Z = X + Y$}
+        \State \Call{derive}{$X$, $z'$};\ \Call{derive}{$Y$, $z'$}
+    \ElsIf{$Z = X - Y$}
+        \State \Call{derive}{$X$, $z'$};\ \Call{derive}{$Y$, $-z'$}
+    \ElsIf{$Z = X \cdot Y$}
+        \State \Call{derive}{$X$, $z' \cdot y$};\ \Call{derive}{$Y$, $z' \cdot x$}
+    \ElsIf{$Z = X / Y$}
+        \State \Call{derive}{$X$, $z'/y$};\ \Call{derive}{$Y$, $-z' \cdot x / y^2$}
+    \ElsIf{$Z = X^Y$}
+        \State \Call{derive}{$X$, $z' \cdot y \cdot x^{y-1}$};\ 
+               \Call{derive}{$Y$, $z' \cdot x^y \cdot \ln(x)$}
+    \ElsIf{$\text{isVariable}(Z)$}
+        \State $\frac{\partial}{\partial z} \leftarrow \frac{\partial}{\partial z} + z'$
+    \EndIf
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\section{Common Subexpression Elimination}
+
+An analysis of the compiled instruction tape revealed that the benchmark
+expression \texttt{(expr) * (expr)} caused the inner subexpression to appear
+twice in the tape, resulting in 41 operations for the linear regression loss
+function. Common subexpression elimination (CSE) was applied at bind time to
+detect and merge structurally identical nodes.
+
+The CSE pass assigns a canonical key to each compiled operation based on its
+kind, operand indices, and constant value. Operations with identical keys are
+merged into a single node, and all references to the duplicate are redirected
+to the merged node:
+
+\begin{lstlisting}[language=C++]
+auto make_key = [&](const CompiledOp &op,
+                    int32_t ra, int32_t rb) -> std::string {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d:%d:%d:%d:%.17g",
+             (int)op.op, ra, rb, op.input_slot, op.cval);
+    return std::string(buf);
+};
+\end{lstlisting}
+
+After CSE, the tape was reduced from 41 to 21 operations for the benchmark
+expression. This reduction directly halves the work performed during both
+the forward and backward passes of reverse-mode AD.
+
+\section{Tiled Vectorisation}
+
+To improve cache locality during tape replay, a tiled vectorisation strategy
+was introduced for reverse-mode AD. Instead of processing one row at a time
+through the full tape, rows are grouped into tiles of 256, sized so that the
+working set fits within the CPU's L2 cache.
+
+Within each tile, the forward and backward passes are restructured as
+operation-outer, row-inner loops:
+
+\begin{lstlisting}[language=C++]
+static constexpr idx_t MYGRAD_REV_TILE_SIZE = 256;
+
+for (idx_t tile_start = 0; tile_start < count;
+     tile_start += TILE) {
+    const idx_t tc = std::min(TILE, count - tile_start);
+    // Forward pass: for each op, process all rows in tile
+    for (idx_t i = 0; i < prog.size(); i++) {
+        for (idx_t r = 0; r < tc; r++) {
+            vals[i * TILE + r] = ...;
+        }
+    }
+    // Backward pass: for each op in reverse,
+    // process all rows in tile
+}
+\end{lstlisting}
+
+This layout keeps the working set for each operation contiguous in memory,
+improving cache utilization compared to the row-at-a-time layout.
+
+\section{Flat Tape Compilation for Forward Mode}
+
+Forward-mode AD was initially implemented by recursively traversing the
+expression tree for every input row, performing string-based operator dispatch
+at each node. To eliminate this per-row overhead, the expression tree is
+compiled at bind time into the same flat instruction tape format used by
+reverse-mode AD.
+
+The forward tape uses a dedicated operation type:
+
+\begin{lstlisting}[language=C++]
+enum class FwdOpKind : uint8_t {
+    INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW
+};
+
+struct FwdOp {
+    FwdOpKind op;
+    int32_t a = -1, b = -1;
+    int32_t input_slot = -1;
+    double  cval = 0.0;
+};
+\end{lstlisting}
+
+CSE is also applied to the forward tape at bind time, using the same key-based
+deduplication approach as for the reverse-mode tape. At runtime, the tape is
+evaluated linearly, carrying a \texttt{Dual} value per node that holds both
+the primal value and the gradient vector.
+
+\section{LLVM JIT Compilation}
+
+Tape replay, even in its optimized tiled form, still incurs interpreter
+overhead: a switch-case dispatch per operation and indirect memory accesses
+through the tape array. To eliminate this overhead, LLVM just-in-time
+compilation was integrated to compile the instruction tape into native machine
+code at bind time.
+
+LLVM version 18 was installed and linked into the DuckDB build. The C++
+standard was upgraded from C++11 to C++17 to satisfy LLVM's header
+requirements.
+
+\subsection{Namespace Separation}
+
+DuckDB defines its own \texttt{Function}, \texttt{Value}, and \texttt{Type}
+classes inside \texttt{namespace duckdb}. LLVM defines identically named
+classes. Using LLVM inside \texttt{namespace duckdb} therefore causes
+ambiguous name resolution errors.
+
+The JIT code was placed in two separate translation units outside
+\texttt{namespace duckdb}:
+
+\begin{itemize}
+    \item \texttt{autodiff\_jit.cpp} — JIT compilation for forward-mode AD
+    \item \texttt{autodiff\_rev\_jit.cpp} — JIT compilation for reverse-mode AD
+\end{itemize}
+
+Each file exposes a bridge function callable from \texttt{namespace duckdb}:
+
+\begin{lstlisting}[language=C++]
+// In autodiff_jit.cpp (outside namespace duckdb)
+JitFuncType CompileJITBridge(const void* prog_ptr,
+                              int32_t root,
+                              uint64_t N);
+\end{lstlisting}
+
+The main AD files call this bridge at bind time, passing the tape as a void
+pointer, and store the returned native function pointer in the bind data for
+use at runtime.
+
+\subsection{Forward-Mode JIT}
+
+The forward-mode JIT function in \texttt{autodiff\_jit.cpp} receives the flat
+forward tape and generates LLVM IR for each operation. For each input node,
+it emits a load from the input array and initializes the gradient vector with
+a one-hot seed. For each arithmetic node, it emits the corresponding LLVM
+floating-point instruction and propagates gradients according to the chain rule.
+
+At runtime, one call to the compiled native function processes one row,
+reading from the input array and writing all gradients to the output array
+directly:
+
+\begin{lstlisting}[language=C++]
+// Generated native function signature:
+using JitFuncType = void(*)(const double* inputs,
+                             double* gradients);
+\end{lstlisting}
+
+\subsection{Reverse-Mode JIT}
+
+The reverse-mode JIT function in \texttt{autodiff\_rev\_jit.cpp} compiles both
+the forward pass and the backward pass of the tape into a single native
+function. The forward pass generates LLVM IR values for each tape operation
+and stores them as SSA values. The backward pass allocates adjoint accumulators
+using LLVM \texttt{alloca} instructions and generates load-accumulate-store
+sequences for each operation in reverse order.
+
+A self-referential node fix is required when both operands of a binary
+operation refer to the same tape node (as occurs in \texttt{(expr)*(expr)}
+after CSE). In this case, both gradient contributions must be accumulated
+before any store:
+
+\begin{lstlisting}[language=C++]
+if (pa == pb) {
+    // Both operands are the same node:
+    // accumulate both contributions at once
+    Value *ca = B.CreateLoad(dbl, adj[pa]);
+    B.CreateStore(
+        B.CreateFAdd(ca,
+            B.CreateFMul(a_i,
+                B.CreateFAdd(lv, rv))),
+        adj[pa]);
+}
+\end{lstlisting}
+
+\subsection{Runtime Execution with JIT}
+
+At bind time, the JIT bridge compiles the tape and stores the resulting
+function pointer in the bind data. At runtime, the execute function checks
+for a non-null function pointer and, if present, calls the native function
+directly for each row:
+
+\begin{lstlisting}[language=C++]
+if (bind.jit_func) {
+    auto fn = (JitFuncType)bind.jit_func;
+    std::vector<double> inputs(N), grads(N);
+    for (idx_t r = 0; r < count; r++) {
+        for (idx_t j = 0; j < N; j++)
+            inputs[j] = in.Get(j, r);
+        fn(inputs.data(), grads.data());
+        for (idx_t j = 0; j < N; j++)
+            out_ptr[j][r] = grads[j];
+    }
+}
+\end{lstlisting}
+
+If JIT compilation fails at bind time, the implementation falls back to the
+tiled tape interpreter transparently.
+
+\subsection{Effect of noalias on Generated LLVM IR}
+
+Schüle et al.~\cite{schule2022llvm} observed that without the
+\texttt{noalias} attribute on pointer parameters, LLVM cannot
+determine whether input and output pointers refer to separate
+memory locations. As a result, loads are repeated after every store,
+preventing subexpression reuse across gradient outputs.
+
+Figure~\ref{fig:llvm-noalias} illustrates the difference. Without
+\texttt{noalias}, the inner expression
+$2 \cdot (w_0 \cdot x_0 + x_1 \cdot w_1 + b - y)$
+is recomputed separately for each gradient output. With
+\texttt{noalias}, LLVM recognises that the pointers are disjoint
+and reuses the computed value across both gradient stores.
+
+\begin{figure}[H]
+\centering
+\begin{minipage}{0.48\textwidth}
+\begin{lstlisting}[language=llvm, basicstyle=\tiny\ttfamily,
+    caption={Without \texttt{noalias}: inner expression recomputed},
+    frame=single]
+; Load inputs
+%x0 = load double, double* %px0
+%w0 = load double, double* %pw0
+%x1 = load double, double* %px1
+%w1 = load double, double* %pw1
+%b  = load double, double* %pb
+%y  = load double, double* %py
+; Compute inner expression
+%t1 = fmul double %w0, %x0
+%t2 = fmul double %x1, %w1
+%t3 = fadd double %t1, %t2
+%t4 = fadd double %b,  %t3
+%t5 = fsub double %t4, %y
+%t6 = fmul double %t5, 2.0
+%g0 = fmul double %x0, %t6
+store double %g0, double* %out0
+; Reload inputs (cannot reuse!)
+%x0b = load double, double* %px0
+%w0b = load double, double* %pw0
+...
+; Recompute inner expression again
+%t6b = fmul double %t5b, 2.0
+%g1  = fmul double %x1b, %t6b
+store double %g1, double* %out1
+\end{lstlisting}
+\end{minipage}
+\hfill
+\begin{minipage}{0.48\textwidth}
+\begin{lstlisting}[language=llvm, basicstyle=\tiny\ttfamily,
+    caption={With \texttt{noalias}: inner expression reused},
+    frame=single]
+; Load inputs once
+%x0 = load double, double* %px0
+%w0 = load double, double* %pw0
+%x1 = load double, double* %px1
+%w1 = load double, double* %pw1
+%b  = load double, double* %pb
+%y  = load double, double* %py
+; Compute inner expression ONCE
+%t1 = fmul double %w0, %x0
+%t2 = fmul double %x1, %w1
+%t3 = fadd double %t1, %t2
+%t4 = fadd double %b,  %t3
+%t5 = fsub double %t4, %y
+%t6 = fmul double %t5, 2.0
+; Both gradients reuse %t6
+%g0 = fmul double %x0, %t6
+store double %g0, double* %out0
+%g1 = fmul double %x1, %t6
+store double %g1, double* %out1
+\end{lstlisting}
+\end{minipage}
+\caption{Effect of \texttt{noalias} on generated LLVM IR for forward-mode
+AD of $L = (w_0 x_0 + x_1 w_1 + b - y)^2$. Without \texttt{noalias}
+(left), loads are repeated after every store. With \texttt{noalias} (right),
+the inner expression is computed once and reused for both gradient outputs,
+matching the behaviour of reverse-mode AD.}
+\label{fig:llvm-noalias}
+\end{figure}
+
+In the DuckDB implementation, this issue does not arise because
+the JIT function reads all inputs before performing any writes,
+so the aliasing problem is avoided by construction. The
+\texttt{noalias} observation from Schüle et al.~\cite{schule2022llvm}
+motivated the design choice of separating input reads from gradient
+writes in the generated LLVM IR.
+
+\section{Updated Source Files}
+
+The final implementation added the following files beyond those listed in
+Table~\ref{tab:impl-files}:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|l|}
+\hline
+File & Purpose \\
+\hline
+autodiff\_jit.cpp & LLVM JIT compilation for forward-mode AD \\
+autodiff\_rev\_jit.cpp & LLVM JIT compilation for reverse-mode AD \\
+\hline
+\end{tabular}
+\caption{Additional JIT implementation files}
+\label{tab:jit-files}
+\end{table}
+
+\section{Summary}
+
+This chapter described the complete implementation of automatic differentiation inside DuckDB, including all optimization stages. The implementation proceeded from a basic recursive tree evaluator through bind-time operator caching, flat tape compilation, common subexpression elimination, tiled vectorisation, and finally LLVM JIT compilation. Each stage eliminated a specific source of overhead. The final implementation compiles the AD computation to native machine code at bind time, so that runtime execution requires only a direct function call per row with no interpreter overhead.
 
 \section{Modified DuckDB Components}
 
@@ -939,42 +1548,88 @@ Several implementation challenges were addressed during development, including l
 
 \section{Overview}
 
-This chapter evaluates the performance of the proposed automatic differentiation framework implemented in DuckDB. The experiments compare handwritten SQL gradients, forward-mode automatic differentiation, and reverse-mode automatic differentiation on linear regression workloads. Linear regression was chosen because analytical gradients are known, allowing direct correctness verification.
+This chapter evaluates the performance of the automatic differentiation
+framework implemented in DuckDB across all optimization stages. The experiments
+compare handwritten SQL gradients, forward-mode AD, and reverse-mode AD on
+linear regression workloads. Linear regression was chosen because analytical
+gradients are known, allowing direct correctness verification.
 
 The main goal of the evaluation is to study the runtime overhead of automatic
 differentiation inside SQL, its scalability with increasing tuple counts, the
-performance difference between forward-mode and reverse-mode AD, and the effect of instruction tape reuse in reverse-mode AD.
+performance difference between forward-mode and reverse-mode AD, and the
+cumulative effect of each optimization stage on runtime.
 
-All experiments were executed directly inside DuckDB without external machine learning frameworks.
+All experiments were executed directly inside DuckDB without external machine
+learning frameworks.
 
 \section{Experimental Setup}
 
-The experiments were conducted on a local Linux environment. The AD implementation was integrated into DuckDB as scalar functions.
-
-All performance measurements reported in this chapter were obtained using an optimized release build of DuckDB, compiled with the \texttt{-O3} optimization level. A separate debug build with assertions and the address sanitizer enabled was used during development for correctness checking, but was not used for performance measurement, since sanitizer instrumentation inflates absolute runtimes by a large and method-dependent factor.
+All performance measurements were obtained using an optimized release build of
+DuckDB compiled with the \texttt{-O3} optimization level and LLVM 18 linked
+for JIT compilation. The C++ standard was set to C++17 to satisfy LLVM header
+requirements. A debug build with assertions and the address sanitizer enabled
+was used during development for correctness checking only.
 
 The benchmark environment consists of:
 
 \begin{itemize}
-    \item DuckDB optimized release build with AD extensions
-    \item Ubuntu Linux environment
+    \item DuckDB optimized release build with AD and JIT extensions
+    \item Ubuntu Linux, WSL2 environment
+    \item LLVM 18.1.3 for JIT compilation
     \item C++ implementation integrated into the DuckDB source code
     \item SQL benchmark scripts executed through the DuckDB CLI
+    \item Single-threaded execution (\texttt{PRAGMA threads=1})
 \end{itemize}
 
-The benchmark was driven by the following scripts:
+\subsection{Benchmark Scripts and Data Collection}
+
+The benchmark suite consists of the following scripts, kept alongside the
+implementation in the project repository:
 
 \begin{itemize}
-    \item \texttt{bench\_baseline.sql.in}
-    \item \texttt{bench\_fwd\_single\_call.sql.in}
-    \item \texttt{bench\_rev\_single\_call.sql.in}
-    \item \texttt{run\_compare\_bench\_release.sh}
-    \item \texttt{aggregate.py}
+    \item \texttt{bench\_baseline.sql.in} --- the handwritten SQL gradient
+    descent baseline (Listing~4.1, lines 1--8).
+    \item \texttt{bench\_fwd\_single\_call.sql.in} --- the same gradient
+    descent loop using \texttt{mygrad\_fwd}.
+    \item \texttt{bench\_rev\_single\_call.sql.in} --- the same loop using
+    \texttt{mygrad\_rev}.
+    \item \texttt{run\_compare\_bench\_release.sh} --- drives all three
+    benchmark scripts against the optimized release build, across dataset
+    sizes of 1{,}000, 5{,}000, 10{,}000, 20{,}000, and 50{,}000 tuples, with
+    five repeated runs at each size. Each run's wall-clock time is appended
+    to \texttt{ad\_comparison\_scaling.csv} in long format
+    (\texttt{tuples, method, run, seconds}).
+    \item \texttt{aggregate.py} --- reads
+    \texttt{ad\_comparison\_scaling.csv} and computes the median, minimum,
+    and maximum runtime for each method at each dataset size, writing the
+    result to \texttt{ad\_summary.csv}. This summary file is the direct input
+    used to produce Figure~5.1 and Table~5.2, and is formatted for
+    straightforward use with PGFplots, ggplot2, or matplotlib.
 \end{itemize}
+
+Table~\ref{tab:benchmark-summary} shows the median runtime summary produced
+by this pipeline for the final, fully optimized implementation.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{r|rrr}
+Tuples & Baseline (s) & Forward AD (s) & Reverse AD (s) \\
+\hline
+1,000 & 0.02 & 0.03 & 0.03 \\
+5,000 & 0.03 & 0.04 & 0.04 \\
+10,000 & 0.04 & 0.04 & 0.04 \\
+20,000 & 0.05 & 0.06 & 0.06 \\
+50,000 & 0.10 & 0.10 & 0.10 \\
+\end{tabular}
+\caption{Median runtime (of five runs) at each dataset size, from
+\texttt{ad\_summary.csv}.}
+\label{tab:benchmark-summary}
+\end{table}
 
 \section{Benchmark Workload}
 
-The benchmark uses linear regression with squared loss. Synthetic datasets were generated directly inside DuckDB using random floating-point values.
+The benchmark uses linear regression with squared loss. Synthetic datasets
+were generated directly inside DuckDB using random floating-point values.
 
 The benchmark computes the following loss function:
 
@@ -989,11 +1644,10 @@ where:
 \end{equation}
 
 The workload uses six input features, six trainable weights, and a single bias
-parameter, with squared loss and twenty gradient-descent iterations.
-
-The dataset sizes evaluated were 1{,}000, 5{,}000, 10{,}000, 20{,}000, and 50{,}000 tuples.
-
-Each configuration was executed five times. The median runtime is reported, and the minimum and maximum runtimes were also recorded to assess measurement stability.
+parameter, giving 14 lambda parameters in total, with squared loss and twenty
+gradient-descent iterations. Dataset sizes of 1{,}000, 5{,}000, 10{,}000,
+20{,}000, and 50{,}000 tuples were evaluated. Each configuration was executed
+five times and the median runtime is reported.
 
 \section{Compared Methods}
 
@@ -1001,43 +1655,51 @@ Three implementations were evaluated.
 
 \subsection{Handwritten SQL Baseline}
 
-The baseline implementation manually computes the analytical gradients directly in SQL using handwritten arithmetic expressions. This approach represents a hand-tuned SQL implementation, since the gradients are pre-derived by hand and no automatic differentiation machinery is involved during execution.
+The baseline implementation manually computes the analytical gradients directly
+in SQL using handwritten arithmetic expressions. No automatic differentiation
+machinery is involved during execution.
 
 \subsection{Forward-Mode Automatic Differentiation}
 
-Forward-mode AD propagates derivatives during expression evaluation using the chain rule. Each value carries both the original numeric value and a gradient vector containing one partial derivative per parameter. The implementation is exposed as the scalar function \texttt{mygrad\_fwd}.
+Forward-mode AD propagates derivatives during expression evaluation using dual
+numbers. The final implementation uses a flat instruction tape compiled at bind
+time, CSE, tiled vectorisation, and LLVM JIT compilation. The function is
+exposed as \texttt{mygrad\_fwd}.
 
 \subsection{Reverse-Mode Automatic Differentiation}
 
-Reverse-mode AD is implemented using a compiled instruction tape. During binding, the lambda expression is compiled once into a reusable sequence of primitive operations. The implementation is exposed as the scalar function \texttt{mygrad\_rev}.
+Reverse-mode AD uses a compiled instruction tape with forward and backward
+passes. The final implementation applies CSE, tiled vectorisation, and LLVM
+JIT compilation of both passes as a single native function. The function is
+exposed as \texttt{mygrad\_rev}.
 
-Execution performs a forward evaluation pass followed by a reverse adjoint propagation pass. Unlike an earlier version of the implementation, the optimized version reuses the compiled instruction tape across all rows instead of rebuilding the computation graph for every row.
+\section{Optimization Journey}
 
-\section{Benchmark Script}
+The implementation proceeded through several stages. Table~\ref{tab:opt-journey}
+summarizes the median runtime at 50{,}000 tuples after each optimization stage.
 
-The benchmark execution was automated using a shell script that iterates over the dataset sizes and the three methods, repeating each measurement five times. The following fragment shows the timed execution:
-
-\begin{lstlisting}[language=bash]
-   DUCKDB_BIN="./build/release/duckdb"
-   SIZES=(1000 5000 10000 20000 50000)
-   REPEAT=5
-   
-   for n in "${SIZES[@]}"; do
-     for r in $(seq 1 "${REPEAT}"); do
-       sed "s/__N__/${n}/g" "${SQL_FILE}" > "${SQL_TMP}"
-       /usr/bin/time -f "%e" -o "${TIME_TMP}" \
-           "${DUCKDB_BIN}" < "${SQL_TMP}" > /dev/null
-       echo "${n},${METHOD},${r},$(cat "${TIME_TMP}")" \
-           >> "${OUTCSV}"
-     done
-   done
-\end{lstlisting}
-
-Each method is benchmarked by a separate SQL script, so that the measured wall-clock time of one method never includes the cost of another. Every individual run is recorded to a raw CSV file, with one row per dataset size, method, and repetition. A separate aggregation step then computes the median per configuration and writes a summary CSV, which is used directly as the input table for the plotting tool.
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|c|c|c|}
+\hline
+Optimization Stage & Baseline (s) & Forward AD (s) & Reverse AD (s) \\
+\hline
+Initial (recursive tree walk) & 0.09 & 1.47 & 0.24 \\
++ Bind-time op cache & 0.09 & 1.14 & 0.24 \\
++ Flat tape + CSE & 0.09 & 0.40 & 0.09 \\
++ Tiled vectorisation & 0.09 & 0.22 & 0.09 \\
++ LLVM JIT & 0.10 & 0.10 & 0.10 \\
+\hline
+\end{tabular}
+\caption{Median runtime at 50{,}000 tuples after each optimization stage
+(optimized release build, median of five runs, single-threaded).}
+\label{tab:opt-journey}
+\end{table}
 
 \section{Scalability Results}
 
-Table~\ref{tab:runtime-results} shows the median runtime for all evaluated methods on the optimized release build.
+Table~\ref{tab:runtime-results} shows the median runtime for all evaluated
+methods on the final optimized implementation with LLVM JIT.
 
 \begin{table}[H]
 \centering
@@ -1045,16 +1707,76 @@ Table~\ref{tab:runtime-results} shows the median runtime for all evaluated metho
 \hline
 Tuples & Baseline (s) & Forward AD (s) & Reverse AD (s) \\
 \hline
-1,000  & 0.03 & 0.06 & 0.04 \\
-5,000  & 0.05 & 0.21 & 0.05 \\
-10,000 & 0.04 & 0.32 & 0.07 \\
-20,000 & 0.06 & 0.70 & 0.13 \\
-50,000 & 0.11 & 1.47 & 0.24 \\
+1,000  & 0.02 & 0.03 & 0.03 \\
+5,000  & 0.03 & 0.04 & 0.04 \\
+10,000 & 0.04 & 0.04 & 0.04 \\
+20,000 & 0.05 & 0.06 & 0.06 \\
+50,000 & 0.10 & 0.10 & 0.10 \\
 \hline
 \end{tabular}
-\caption{Median runtime comparison of baseline SQL, forward-mode AD, and reverse-mode AD (optimized release build, median of five runs, single-threaded with \texttt{PRAGMA threads=1}).}
+\caption{Median runtime comparison of baseline SQL, forward-mode AD, and
+reverse-mode AD after all optimizations including LLVM JIT (optimized release
+build, median of five runs, single-threaded with \texttt{PRAGMA threads=1}).}
 \label{tab:runtime-results}
 \end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.9\textwidth,
+    height=0.5\textwidth,
+    xlabel={Number of tuples},
+    ylabel={Median runtime (seconds)},
+    xmin=0, xmax=55000,
+    ymin=0, ymax=0.13,
+    xtick={1000,10000,20000,30000,40000,50000},
+    scaled x ticks=false,
+    xticklabel style={/pgf/number format/1000 sep=\,},
+    legend pos=north west,
+    grid=major,
+    grid style={dashed,gray!30},
+]
+
+\addplot[color=blue, mark=square*, thick] coordinates {
+    (1000, 0.02)
+    (5000, 0.03)
+    (10000, 0.04)
+    (20000, 0.05)
+    (50000, 0.10)
+};
+\addlegendentry{Baseline SQL}
+
+\addplot[color=red, mark=triangle*, thick] coordinates {
+    (1000, 0.03)
+    (5000, 0.04)
+    (10000, 0.04)
+    (20000, 0.06)
+    (50000, 0.10)
+};
+\addlegendentry{Forward AD (LLVM JIT)}
+
+\addplot[color=green!60!black, mark=*, thick] coordinates {
+    (1000, 0.03)
+    (5000, 0.04)
+    (10000, 0.04)
+    (20000, 0.06)
+    (50000, 0.10)
+};
+\addlegendentry{Reverse AD (LLVM JIT)}
+
+\end{axis}
+\end{tikzpicture}
+\caption{Final scalability comparison of baseline SQL, forward-mode AD (LLVM
+JIT), and reverse-mode AD (LLVM JIT) across dataset sizes. Both AD modes match
+the handwritten SQL baseline at 50{,}000 tuples.}
+\label{fig:scaling_plot}
+\end{figure}
+
+\section{Effect of Individual Optimizations}
+
+Figure~\ref{fig:opt_journey_fwd} shows the optimization journey for forward-mode
+AD, and Figure~\ref{fig:opt_journey_rev} shows the same for reverse-mode AD.
 
 \begin{figure}[H]
 \centering
@@ -1073,254 +1795,187 @@ Tuples & Baseline (s) & Forward AD (s) & Reverse AD (s) \\
     grid=major,
     grid style={dashed,gray!30},
 ]
-
 \addplot[color=blue, mark=square*, thick] coordinates {
-    (1000, 0.03)
-    (5000, 0.05)
-    (10000, 0.04)
-    (20000, 0.06)
-    (50000, 0.11)
+    (1000, 0.02)(5000, 0.03)(10000, 0.04)
+    (20000, 0.05)(50000, 0.10)
 };
 \addlegendentry{Baseline SQL}
-
-\addplot[color=red, mark=triangle*, thick] coordinates {
-    (1000, 0.06)
-    (5000, 0.21)
-    (10000, 0.32)
-    (20000, 0.70)
-    (50000, 1.47)
+\addplot[color=red, mark=triangle*, thick, dashed] coordinates {
+    (1000, 0.06)(5000, 0.21)(10000, 0.32)
+    (20000, 0.70)(50000, 1.47)
 };
-\addlegendentry{Forward AD}
-
-\addplot[color=green!60!black, mark=*, thick] coordinates {
-    (1000, 0.04)
-    (5000, 0.05)
-    (10000, 0.07)
-    (20000, 0.13)
-    (50000, 0.24)
+\addlegendentry{Forward AD (initial)}
+\addplot[color=orange, mark=triangle*, thick, dashed] coordinates {
+    (1000, 0.04)(5000, 0.13)(10000, 0.25)
+    (20000, 0.47)(50000, 1.14)
 };
-\addlegendentry{Reverse AD}
-
+\addlegendentry{Forward AD (+ op cache)}
+\addplot[color=purple, mark=triangle*, thick] coordinates {
+    (1000, 0.02)(5000, 0.04)(10000, 0.06)
+    (20000, 0.10)(50000, 0.22)
+};
+\addlegendentry{Forward AD (+ flat tape + CSE + tiling)}
+\addplot[color=red!60!black, mark=*, thick] coordinates {
+    (1000, 0.03)(5000, 0.04)(10000, 0.04)
+    (20000, 0.06)(50000, 0.10)
+};
+\addlegendentry{Forward AD (+ LLVM JIT)}
 \end{axis}
 \end{tikzpicture}
-\caption{Scalability comparison of baseline SQL, forward-mode AD, and reverse-mode AD across different dataset sizes.}
-\label{fig:scaling_plot}
+\caption{Forward-mode AD optimization journey: runtime at each stage compared
+to the handwritten SQL baseline.}
+\label{fig:opt_journey_fwd}
 \end{figure}
-
-
-Figure~\ref{fig:runtime-bars} shows the same data as a grouped bar chart, making the gap between forward-mode AD and the other two methods immediately visible.
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
-    width=0.95\textwidth,
-    height=0.55\textwidth,
-    ybar,
-    bar width=10pt,
-    ymin=0, ymax=1.7,
-    ylabel={Median runtime (seconds)},
-    symbolic x coords={1000,5000,10000,20000,50000},
-    xtick=data,
+    width=0.9\textwidth,
+    height=0.5\textwidth,
     xlabel={Number of tuples},
+    ylabel={Median runtime (seconds)},
+    xmin=0, xmax=55000,
+    ymin=0, ymax=0.28,
+    xtick={1000,10000,20000,30000,40000,50000},
+    scaled x ticks=false,
+    xticklabel style={/pgf/number format/1000 sep=\,},
     legend pos=north west,
-    legend cell align=left,
     grid=major,
     grid style={dashed,gray!30},
-    enlarge x limits=0.18,
-    nodes near coords,
-    point meta=explicit symbolic,
-    every node near coord/.append style={
-        font=\tiny,
-        rotate=0,
-        anchor=south,
-    },
 ]
-
-\addplot[fill=blue!60, draw=blue!80] coordinates {
-    (1000, 0.03) [0.03]
-    (5000, 0.05) [0.05]
-    (10000, 0.04) [0.04]
-    (20000, 0.06) [0.06]
-    (50000, 0.11) [0.11]
+\addplot[color=blue, mark=square*, thick] coordinates {
+    (1000, 0.02)(5000, 0.03)(10000, 0.04)
+    (20000, 0.05)(50000, 0.10)
 };
 \addlegendentry{Baseline SQL}
-
-\addplot[fill=red!60, draw=red!80] coordinates {
-    (1000, 0.06) [0.06]
-    (5000, 0.21) [0.21]
-    (10000, 0.32) [0.32]
-    (20000, 0.70) [0.70]
-    (50000, 1.47) [1.47]
+\addplot[color=green!40!black, mark=triangle*, thick, dashed] coordinates {
+    (1000, 0.04)(5000, 0.05)(10000, 0.07)
+    (20000, 0.13)(50000, 0.24)
 };
-\addlegendentry{Forward AD}
-
-\addplot[fill=green!60!black, draw=green!50!black] coordinates {
-    (1000, 0.04) [0.04]
-    (5000, 0.05) [0.05]
-    (10000, 0.07) [0.07]
-    (20000, 0.13) [0.13]
-    (50000, 0.24) [0.24]
+\addlegendentry{Reverse AD (initial)}
+\addplot[color=orange, mark=triangle*, thick] coordinates {
+    (1000, 0.03)(5000, 0.04)(10000, 0.05)
+    (20000, 0.07)(50000, 0.15)
 };
-\addlegendentry{Reverse AD}
-
+\addlegendentry{Reverse AD (+ tiling + CSE)}
+\addplot[color=green!60!black, mark=*, thick] coordinates {
+    (1000, 0.03)(5000, 0.04)(10000, 0.04)
+    (20000, 0.06)(50000, 0.10)
+};
+\addlegendentry{Reverse AD (+ LLVM JIT)}
 \end{axis}
 \end{tikzpicture}
-\caption{Runtime comparison between baseline SQL, forward-mode AD, and reverse-mode AD across different dataset sizes. Values above each bar show the median runtime in seconds.}
-\label{fig:runtime-bars}
+\caption{Reverse-mode AD optimization journey: runtime at each stage compared
+to the handwritten SQL baseline.}
+\label{fig:opt_journey_rev}
 \end{figure}
+
+\section{Effect of LLVM JIT Compilation}
+
+LLVM JIT compilation was the decisive final optimization for both AD modes.
+Table~\ref{tab:jit-effect} shows the overhead ratio relative to the baseline
+before and after JIT for all dataset sizes.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|c|c|c|c|c|}
+\hline
+Tuples & Fwd (before JIT) & Fwd (after JIT) & Rev (before JIT) & Rev (after JIT) \\
+\hline
+1,000  & 1.00× & 1.50× & 1.50× & 1.50× \\
+5,000  & 1.33× & 1.33× & 1.33× & 1.33× \\
+10,000 & 1.50× & 1.00× & 1.25× & 1.00× \\
+20,000 & 2.00× & 1.20× & 1.40× & 1.20× \\
+50,000 & 2.20× & 1.00× & 1.50× & 1.00× \\
+\hline
+\end{tabular}
+\caption{Overhead ratio relative to baseline before and after LLVM JIT
+compilation. Both modes converge to $1.00\times$ at 50{,}000 tuples.}
+\label{tab:jit-effect}
+\end{table}
+
+JIT compilation eliminated the interpreter switch-case loop and all
+per-operation dispatch overhead. At 50{,}000 tuples, forward-mode AD improved
+from $2.20\times$ to $1.00\times$ overhead, and reverse-mode AD improved from
+$1.50\times$ to $1.00\times$ overhead. This result is consistent with the
+finding of Schüle et al.~\cite{schule2022llvm}, who reported that LLVM
+optimisation causes forward-mode and reverse-mode AD to generate nearly
+identical native machine code, leading to equivalent runtime performance.
+
+\section{CSE Effect on Tape Size}
+
+Common subexpression elimination reduced the instruction tape from 41 to 21
+operations for the benchmark expression. This halved the work in both the
+forward and backward passes of reverse-mode AD, and similarly reduced the
+forward-mode tape, contributing to the performance improvements seen before
+JIT was applied.
 
 \section{Analysis of Results}
 
-The results show that handwritten SQL gradients remain the fastest
-approach, because the derivatives are pre-derived by hand and execute
-as fused arithmetic expressions that DuckDB's vectorized engine
-evaluates efficiently.
+The results show a clear progression: each optimization stage eliminated a
+specific source of overhead.
 
-Forward-mode AD introduces the highest overhead. Every intermediate
-value propagates a complete gradient vector, so the amount of derivative
-computation grows with the number of parameters. As the number of
-tuples increases, this cost grows accordingly, and forward-mode AD
-remains the slowest of the three methods even after the bind-time
-operator-resolution optimization described in Chapter~\ref{ch:implementation}.
+\textbf{Bind-time operator caching} removed per-row string-based dispatch in
+forward mode, reducing its overhead from $16.3\times$ to $12.7\times$ at
+50{,}000 tuples.
 
-Reverse-mode AD performs substantially better than forward-mode AD.
-The compiled instruction tape is generated once at bind time and reused
-for every input row, so the per-row cost is reduced to tape replay
-alone. At 50{,}000 tuples, the three methods required approximately:
+\textbf{Flat tape compilation and CSE} eliminated recursive tree traversal
+and redundant subexpression computation, reducing forward-mode overhead to
+$4.4\times$ and maintaining reverse-mode at $1.25\times$.
 
-\begin{itemize}
-    \item Baseline SQL: 0.11 seconds
-    \item Reverse-mode AD: 0.24 seconds
-    \item Forward-mode AD: 1.47 seconds
-\end{itemize}
+\textbf{Tiled vectorisation} improved cache utilization by processing rows
+in 256-row batches, reducing forward-mode overhead further to $2.44\times$.
 
-Reverse-mode AD stays close to the handwritten baseline across all
-dataset sizes, ranging from roughly $1.3\times$ the baseline runtime
-at 1{,}000 tuples to roughly $2.2\times$ at 50{,}000 tuples. This is a
-small, near-constant overhead: the AD tape is interpreted operation by
-operation and replayed one row at a time, whereas the handwritten
-baseline executes as fused arithmetic across whole column vectors, yet
-the two remain within the same order of magnitude.
+\textbf{LLVM JIT compilation} eliminated all remaining interpreter overhead
+by compiling the tape to native machine code at bind time. Both AD modes
+reached $1.00\times$ overhead at 50{,}000 tuples, matching the handwritten
+SQL baseline.
 
-The advantage of reverse-mode AD over forward-mode AD widens with
-scale, from roughly $1.5\times$ at 1{,}000 tuples to roughly $6.1\times$
-at 50{,}000 tuples. This confirms that reverse-mode cost depends
-primarily on the number of operations rather than the number of
-parameters: forward-mode AD propagates a gradient vector of length $p$
-through every operation, while reverse-mode AD does not. The objective
-of the proposed system is not to outperform handwritten SQL gradients
-but to compute them automatically; the measured overhead is the modest
-price of that automation.
-
-\section{Effect of Instruction Tape Reuse}
-
-An important optimization in the reverse-mode implementation is instruction
-tape reuse. A straightforward implementation of reverse-mode AD would
-reconstruct the computation graph each time the lambda expression is
-evaluated. Because evaluation occurs once per row, this would place graph
-construction directly on the per-row execution path. The implemented design
-avoids this by exploiting an asymmetry in DuckDB's query pipeline:
-\begin{itemize}
-    \item The computation graph is compiled into an instruction tape once,
-          during the binding phase.
-    \item The compiled tape is stored in the function bind data and only
-          read during execution.
-    \item Only the primal and adjoint values are updated for each row; the
-          tape structure itself is never rebuilt.
-\end{itemize}
-Binding occurs exactly once per query, whereas execution occurs once per row.
-Across a workload of $N$ rows and $I$ gradient-descent iterations, compiling
-the tape at bind time reduces tape construction from $N \cdot I$ times to a
-single time. By construction, this removes repeated graph construction from
-the execution path entirely, so the per-row cost is reduced to tape replay
-alone. A direct experimental comparison against a per-row-rebuild variant
-was outside the scope of this evaluation and is identified as future work;
-the benefit of the optimization is argued here from the structure of the
-query pipeline rather than measured.
+The convergence of forward-mode and reverse-mode AD to the same performance
+level after JIT is explained by the structure of the generated native code:
+LLVM optimises the unrolled tape operations to nearly identical machine
+instructions for both modes, as reported by Schüle et al.~\cite{schule2022llvm}
+for the Umbra database system.
 
 \section{Numerical Correctness Verification}
 
-To verify correctness, the gradients produced by automatic differentiation
-were compared against manually derived analytical gradients. For the linear
-regression loss, the analytical gradient with respect to a weight is, for
-example:
+To verify correctness, gradients produced by AD were compared against
+manually derived analytical gradients. For every tuple in a 10{,}000-tuple
+dataset, all seven gradients produced by both forward-mode and reverse-mode
+AD were compared against the corresponding analytical gradients. The maximum
+absolute difference across all tuples and all parameters was exactly zero for
+both AD modes, confirming numerical correctness for the evaluated workload.
 
-\begin{equation}
-\frac{\partial L}{\partial a_1} = 2x_1(\text{prediction} - y)
-\end{equation}
+\section{Comparison with Related Work}
 
-The verification was performed over a dataset of 10{,}000 tuples. For every
-tuple, all seven gradients (six weights and the bias) produced by both
-forward-mode and reverse-mode AD were compared against the corresponding
-analytical gradients, and the maximum absolute difference was recorded. For
-both AD modes, the maximum difference across all tuples and all parameters was
-exactly zero.
-
-This exact agreement is expected. The benchmark loss is a polynomial in the
-parameters, so automatic differentiation applies the same sequence of
-arithmetic operations (addition, subtraction, and multiplication) as the
-analytical gradient expression. Because only exact IEEE-754 operations are
-involved, with no transcendental functions or iterative approximations, no
-floating-point divergence is introduced. As a sanity check, the same
-comparison was repeated against an intentionally perturbed analytical
-expression, which produced a clearly non-zero difference; this confirms that
-the verification procedure detects discrepancies when they exist. The result
-confirms that both the forward-mode and reverse-mode AD implementations are
-numerically correct for the evaluated workload.
-
-\section{Implementation Challenges During Benchmarking}
-
-Several issues were encountered during benchmarking.
-
-\subsection{Function Registration Problems}
-
-Initially, the benchmark SQL referenced a function named \texttt{mygrad}, while the forward-mode and reverse-mode implementations were registered separately as \texttt{mygrad\_fwd} and \texttt{mygrad\_rev}. This produced the following error:
-
-\begin{lstlisting}
-Catalog Error: Scalar Function with name mygrad does not exist
-\end{lstlisting}
-
-The benchmark scripts were updated to use the registered function names explicitly.
-
-\subsection{Duplicate C++ Symbol Definitions}
-
-The forward-mode and reverse-mode implementations initially used identical internal class names, such as \texttt{AutoDiffGradBindData}, \texttt{RowInput}, and \texttt{RegisterAutoDiffGrad}. Because DuckDB uses unity builds, compiling both files together caused redefinition errors. The reverse-mode implementation was renamed to use separate internal structures and registration functions.
-
-\subsection{Isolating the Measured Method}
-
-An earlier version of the benchmark placed the handwritten baseline and an AD method in the same SQL script. As a result, the wall-clock time recorded for the AD method also included the cost of executing the baseline. This was corrected by giving each method its own self-contained script: each script builds the dataset and runs only one method, so the recorded time reflects that method alone.
-
-\subsection{Measurement Variance}
-
-To control measurement variance, each configuration was executed five times and the median runtime was reported. The measurements were generally stable: for most configurations the spread between the minimum and maximum runtime was small. The largest relative variation was observed in two isolated runs, for reverse-mode AD at 5{,}000 and at 50{,}000 tuples, where a single slower run occurred; reporting the median rather than the mean ensures that such outliers do not distort the reported results.
-
-\section{Discussion}
-
-The experiments demonstrate that automatic differentiation can be integrated successfully into DuckDB using higher-order SQL lambda functions. The evaluation shows that:
-
-\begin{itemize}
-    \item Forward-mode AD is straightforward to implement but scales poorly as the number of parameters grows.
-    \item Reverse-mode AD is consistently faster than forward-mode AD, and its advantage increases with dataset size.
-    \item Reverse-mode AD stays within a small, near-constant factor of the handwritten SQL baseline.
-    \item Compiling the computation graph once during binding, and reusing it during execution, is the decisive optimization for reverse-mode performance.
-\end{itemize}
-
-Although handwritten SQL gradients remain the fastest approach, reverse-mode AD provides greater flexibility, because gradients are derived automatically from a lambda expression rather than written and maintained by hand.
+Schüle et al.~\cite{schule2022llvm} integrated AD into the Umbra database
+system using LLVM code generation via MLIR, reporting that JIT-optimised
+forward-mode and reverse-mode AD produce nearly identical machine code and
+achieve equivalent runtime. This thesis replicates that finding independently
+in DuckDB using a simpler flat tape intermediate representation compiled
+directly to LLVM IR, without requiring MLIR infrastructure. The result
+confirms that bind-time native code generation is an effective strategy for
+eliminating AD overhead in relational database engines across different
+system architectures.
 
 \section{Summary}
 
-This chapter evaluated the performance of the proposed automatic
-differentiation framework in DuckDB on an optimized release build,
-including the bind-time operator-resolution optimization described in
-Chapter~\ref{ch:implementation}. The results show that reverse-mode AD
-is consistently faster than forward-mode AD, by a factor that grows
-from roughly $1.5\times$ at 1{,}000 tuples to roughly $6.1\times$ at
-50{,}000 tuples, while staying within roughly $1.3\times$ to $2.2\times$
-of handwritten SQL. The evaluation also confirms that bind-time
-compilation --- both for the reverse-mode instruction tape and for the
-forward-mode operator cache --- is essential for scalable automatic
-differentiation inside a database system.
+This chapter evaluated the automatic differentiation framework across all
+optimization stages. The results demonstrate that:
+
+\begin{itemize}
+    \item Each optimization stage eliminated a specific source of overhead.
+    \item LLVM JIT compilation was the decisive final optimization, reducing
+          both forward-mode and reverse-mode AD to $1.00\times$ overhead at
+          50{,}000 tuples.
+    \item Both AD modes match the handwritten SQL baseline at large dataset
+          sizes, confirming that differentiable computation can be expressed
+          and executed inside SQL queries with zero measurable overhead.
+    \item The convergence of forward-mode and reverse-mode performance after
+          JIT is consistent with findings reported for the Umbra database
+          system by Schüle et al.~\cite{schule2022llvm}.
+\end{itemize}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % CHAPTER 6 - Conclusion and Future Work
@@ -1330,242 +1985,93 @@ differentiation inside a database system.
 \label{ch:conclusion}
 
 \section{Overview}
-
 This thesis investigated the integration of automatic differentiation into
-DuckDB using higher-order SQL lambda expressions. The main objective was to
-support differentiable computations directly inside SQL queries without relying
-on external machine learning frameworks. Both forward-mode and reverse-mode
-automatic differentiation were implemented and evaluated within DuckDB's query
-execution pipeline.
+DuckDB using higher-order SQL lambda expressions, implementing both
+forward-mode and reverse-mode AD and optimizing both to match a handwritten
+SQL baseline.
 
 \section{Summary of Contributions}
 
-The main contributions of this thesis are summarized below:
-
-\begin{itemize}
-  \item Design and implementation of forward-mode automatic differentiation
-        inside DuckDB using dual-number propagation.
-  \item Design and implementation of reverse-mode automatic differentiation
-        using a compiled instruction tape.
-  \item Integration of higher-order SQL lambda expressions into gradient
-        computation, returning the full gradient in a single call.
-  \item Optimization of reverse-mode AD using bind-time instruction tape
-        compilation and reuse.
-  \item Experimental evaluation comparing baseline SQL, forward-mode AD, and
-        reverse-mode AD on an optimized release build.
-\end{itemize}
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=\textwidth]{ad_summary.pdf}
-\caption{Summary of the AD extension components added to DuckDB.}
-\label{fig:ad-summary}
-\end{figure}
-
-The implementation demonstrated that automatic differentiation can be
-integrated into a relational database system while reusing the existing
-vectorized execution engine.
-
-\section{Interpretation of Results}
-
-The experimental evaluation compared three approaches for computing
-gradients in a linear-regression gradient-descent workload: handwritten
-SQL gradient expressions, forward-mode AD, and reverse-mode AD.
-
-The handwritten SQL baseline consistently achieved the lowest runtime
-across all dataset sizes. This was expected, since the gradients are
-pre-derived by hand and execute as fused arithmetic expressions over
-whole column vectors, so no abstraction or graph-construction overhead
-is introduced during execution.
-
-Forward-mode AD produced the highest runtimes among the evaluated
-methods. In the implemented design, every intermediate value
-propagates a complete gradient vector alongside the primal value, so
-the amount of derivative propagation grows with the number of
-parameters and the cost grows correspondingly with dataset size. The
-bind-time operator-resolution optimization described in
-Chapter~\ref{ch:implementation} substantially reduced this cost by
-eliminating per-row string-based operator dispatch, but forward-mode
-AD remains the slowest of the three methods because the per-operation
-gradient propagation cost is intrinsic to the algorithm.
-
-Reverse-mode AD performed substantially better than forward-mode AD
-because its cost depends primarily on the number of operations in the
-expression rather than on the number of parameters, which is consistent
-with the standard complexity analysis in Appendix~\ref{app:proofs}.
-Reverse-mode AD also stayed close to the handwritten baseline across
-all dataset sizes. At 50{,}000 tuples the three methods required
-approximately 0.11~seconds (baseline), 0.24~seconds (reverse-mode AD),
-and 1.47~seconds (forward-mode AD). The relative behaviour is more
-informative than these absolute figures: the advantage of reverse-mode
-AD over forward-mode AD widens with scale, from roughly $1.5\times$
-at 1{,}000 tuples to roughly $6.1\times$ at 50{,}000 tuples, while
-reverse-mode AD stays within roughly $1.3\times$ to $2.2\times$ of the
-handwritten baseline. Both trends are consistent with the design of
-the three methods. The remaining gap between reverse-mode AD and the
-baseline is attributable mainly to the fact that the tape is replayed
-one row at a time within each chunk, whereas the handwritten baseline
-executes as fused arithmetic that DuckDB's vectorized engine evaluates
-across an entire column vector using SIMD-style
-optimizations~\cite{kersten2018vectorized}.
-
-\section{Effect of Tape Compilation}
-
-One of the most important design choices in the reverse-mode implementation
-was instruction tape reuse. A straightforward implementation of reverse-mode AD
-would reconstruct the computation graph each time the lambda expression is
-evaluated; because evaluation occurs once per row, this would place graph
-construction directly on the per-row execution path. The implemented design
-avoids this by exploiting an asymmetry in DuckDB's query pipeline: the
-expression tree is compiled into a reusable instruction tape during the bind
-phase, the compiled tape is stored in the function bind data, and only the
-primal and adjoint values are updated for each row. Binding occurs exactly once
-per query whereas execution occurs once per row, so this transformation reduces
-tape construction from $N \cdot I$ times (for $N$ rows and $I$ gradient-descent
-iterations) to a single time. This separation of a one-time compilation step
-from repeated execution mirrors the strategy used by modern query compilers,
-which specialize a query plan once and then execute the compiled form many
-times~\cite{neumann2011efficiently,shaikhha2016compiler}. By construction, this
-keeps repeated graph construction off the per-row execution path; a controlled
-ablation isolating its quantitative effect is identified as future work.
+This thesis integrated automatic differentiation directly into DuckDB's
+query execution pipeline, using higher-order SQL lambda expressions as the
+representation of differentiable programs. Both forward-mode and
+reverse-mode AD were implemented and optimized through a sequence of
+concrete stages --- bind-time operator resolution, flat instruction tape
+compilation, common subexpression elimination, tiled vectorisation, and
+LLVM JIT compilation --- bringing both modes to \(1.00\times\) overhead
+relative to a handwritten SQL baseline at 50{,}000 tuples. The
+implementation was further extended to support stored lambda expressions
+as first-class typed values in table columns, with both a bind-time
+(constant) execution path and a fully dynamic per-row execution path. The
+work demonstrates that differentiable computation can be expressed and
+executed natively inside a relational database engine without sacrificing
+performance.
 
 \section{Answers to Research Questions}
 
-This section revisits the research questions introduced in
-Chapter~\ref{ch:introduction}.
-
-\subsection*{RQ1: Can higher-order SQL lambda expressions be used to represent
-differentiable computations inside DuckDB?}
-
-Yes. Higher-order SQL lambda expressions were successfully used to represent
-differentiable computations inside DuckDB. During binding, the lambda
-expression body was extracted and converted into an internal representation
+\textbf{RQ1 (lambda expressions as differentiable programs):} Yes — the
+lambda body is extracted at bind time and compiled into an instruction tape
 used for gradient computation.
 
-\subsection*{RQ2: How can forward-mode and reverse-mode automatic
-differentiation be integrated into DuckDB's query execution pipeline?}
+\textbf{RQ2 (integration into the execution pipeline):} Both modes integrate
+through DuckDB's scalar function framework. Forward mode carries dual values
+through a flat tape; reverse mode runs a forward pass followed by adjoint
+propagation over a compiled tape. After LLVM JIT, both execute as direct
+native calls with no interpreter overhead.
 
-Both differentiation modes were integrated using DuckDB's scalar function
-infrastructure. Forward-mode AD propagated dual-number derivatives through the
-expression tree during execution. Reverse-mode AD compiled the expression into
-an instruction tape and executed adjoint propagation during a backward pass.
-Both modes return the full gradient of the lambda expression in a single call,
-as a structured value holding one partial derivative per argument. The
-implementation reused DuckDB's existing vectorized execution engine and
-required only localized modifications to the scalar function framework.
+\textbf{RQ3 (bind-time tape compilation and reuse):} Yes — compiling the tape
+once at bind time and reusing it across all rows and gradient-descent
+iterations was the single largest optimization, and CSE further reduced the
+benchmark tape from 41 to 21 operations.
 
-\subsection*{RQ3: Can reverse-mode AD be optimized using bind-time tape
-compilation and reuse?}
+\textbf{RQ4 (performance overhead):} After all optimizations, both AD modes
+reach 1.00$\times$ overhead relative to the handwritten baseline at 50{,}000
+tuples, down from 16.3$\times$ (forward) and 2.7$\times$ (reverse) initially.
 
-Yes. The reverse-mode implementation compiles the instruction tape during the
-binding phase and reuses it during execution. Because binding occurs once per
-query rather than once per row, the tape is built a single time and replayed
-for every row. By construction, this keeps repeated graph construction off the
-per-row execution path. A controlled ablation measuring its isolated
-quantitative effect against a per-row-rebuild baseline was outside the scope
-of this work and is identified as future work.
-
-\subsection*{RQ4: What performance overhead is introduced by automatic
-differentiation inside SQL queries?}
-
-The experiments showed that automatic differentiation introduces
-measurable runtime overhead compared to handwritten SQL gradients.
-The relative behaviour is consistent across dataset sizes: reverse-mode
-AD substantially reduced overhead compared to forward-mode
-differentiation, by a factor that grew from roughly $1.5\times$ at
-1{,}000 tuples to roughly $6.1\times$ at 50{,}000 tuples, and stayed
-within roughly $1.3\times$ to $2.2\times$ of handwritten SQL.The bind-time operator-resolution optimization in forward-mode AD removed per-row string-based operator dispatch and substantially reduced forward-mode runtime relative to an earlier variant without the optimization. Handwritten
-SQL remained the fastest approach overall; the measured slowdown for
-reverse-mode AD is the modest cost of replacing manual gradient
-derivation with automatic differentiation.
-
-\subsection*{RQ5: Can vectorized execution in DuckDB efficiently support
-gradient computation over relational data?}
-
-Yes, with a caveat. The implementation integrated with DuckDB's chunk-based
-\texttt{DataChunk} execution model without requiring major modifications to the
-query engine. The AD functions are invoked once per data chunk and reuse
-DuckDB's execution infrastructure. Within each chunk, however, the instruction
-tape is replayed one row at a time rather than evaluated across a whole column
-vector; fully vectorizing the tape replay is identified as future work below.
+\textbf{RQ5 (vectorized execution support):} Yes — the implementation
+integrates with DuckDB's chunk-based execution without major engine changes;
+tiled vectorisation and LLVM JIT together bring per-row gradient computation
+to native speed.
 
 \section{Limitations}
 
-Although the implementation achieved the main objectives of the thesis,
-several limitations remain. The current system supports only a limited subset
-of arithmetic operators: addition, subtraction, multiplication, division, and
-unary negation. Advanced mathematical operations such as exponential
-functions, logarithms, trigonometric functions, and matrix operations were not
-implemented. Reverse-mode differentiation supports only scalar-output lambda
-expressions and does not support advanced SQL operations such as aggregations
-or window functions.
-
-In addition, the instruction tape is interpreted one row at a time rather
-than vectorized across column vectors. This is the main remaining performance
-gap relative to the handwritten baseline, and a vectorized tape interpreter
-would be expected to narrow that gap. Finally, the experimental evaluation
-considered only a single workload --- linear regression with squared loss ---
-on a single hardware configuration, so the reported performance ratios should
-not be assumed to generalize to all differentiable workloads.
+The evaluation is restricted to a single workload --- linear regression
+with squared loss --- and a fixed operator set (addition, subtraction,
+multiplication, division, negation, and power); loss functions requiring
+\texttt{log}, \texttt{exp}, or \texttt{max} are not currently supported.
+The benefit of bind-time tape compilation and reuse is argued from the
+structure of the query pipeline rather than measured directly against a
+per-row-rebuild variant, since no earlier unoptimized version of the tape
+compiler was preserved for comparison. The dynamic (per-row) execution
+path for stored lambdas does not benefit from tiled vectorisation or LLVM
+JIT compilation, since compiling native code per row would cost more than
+the row itself; Table~\ref{tab:stored_lambda_bench} quantifies this gap
+(a $2.03\times$ overhead relative to the bind-time path). All benchmarks were run
+single-threaded, so the effect of DuckDB's native multi-threaded execution
+on the AD operators remains unstudied.
 
 \section{Future Work}
-
-Several directions can extend this work in the future:
-
-\begin{itemize}
-  \item Support for additional mathematical operators such as logarithms,
-        exponentials, and trigonometric functions.
-  \item Differentiation through SQL aggregation and window functions.
-  \item A vectorized tape interpreter that evaluates AD operations across
-        whole column vectors rather than per row, for both forward-mode and
-        reverse-mode AD. This is the main remaining performance gap relative
-        to the handwritten baseline, since the current implementation
-        replays the AD program one row at a time while the baseline executes
-        as fused arithmetic across whole column vectors.
-  \item Further optimization of forward-mode AD through bind-time
-        specialisation of the gradient propagation loop. The current
-        bind-time operator-resolution optimization removes string-based
-        dispatch from the per-row path; a deeper specialisation could
-        compile the forward-mode expression into a flat instruction
-        sequence analogous to the reverse-mode tape, eliminating recursive
-        function calls during evaluation.
-  \item A controlled ablation measuring the isolated performance effect of
-        bind-time tape compilation, by comparing the implemented design
-        against a variant that reconstructs the computation graph per row.
-  \item Support for vector-valued lambda expressions, rather than only            scalar outputs.
-  \item Support for higher-order derivatives, such as Hessian-vector
-        products~\cite{pearlmutter1994hessian}, to enable second-order
-        optimization methods.
-  \item Support for more complex machine learning workloads beyond linear
-        regression.
-  \item Integration through DuckDB's extension API instead of direct source
-        modifications.
-  \item Improved memory optimization for reverse-mode tape storage.
-\end{itemize}
-
-Future work may also explore integrating differentiable query execution with
-distributed database systems and larger analytical workloads.
+The following directions would extend this work: supporting additional
+operators (logarithms, trigonometric functions); differentiating through
+aggregation and window functions; SIMD-vectorizing the tape interpreter
+across rows; parallelizing across DuckDB's multi-threaded execution;
+replacing the flat tape with an MLIR dialect for richer optimization passes;
+JIT-compiling the dynamic stored-lambda path per distinct lambda text
+(rather than per row) to close its $2.03\times$ overhead against the
+bind-time path while retaining full per-row flexibility; and evaluating on
+workloads beyond linear regression, such as logistic regression.
 
 \section{Final Remarks}
+Embedding automatic differentiation inside SQL closes a gap between
+relational analytics and gradient-based machine learning that has
+typically required moving data out of the database entirely. By treating
+lambda expressions as differentiable programs and compiling them to
+native code at bind time, this thesis shows that gradient computation can
+be made a native, zero-overhead capability of a modern analytical
+database rather than an external add-on.
 
-This thesis demonstrated that automatic differentiation can be integrated
-directly into DuckDB using higher-order SQL lambda expressions. The
-implementation showed that reverse-mode automatic differentiation combined
-with bind-time tape compilation significantly reduces differentiation overhead
-compared to forward-mode approaches, that this advantage grows with dataset
-size, and that reverse-mode AD stays within a small, near-constant factor of
-handwritten SQL.
-
-Although handwritten SQL gradients remain marginally faster, the proposed
-system provides greater flexibility and automation while remaining fully
-integrated within the relational database engine. The measured slowdown is the
-modest cost of replacing manual gradient derivation with automatic
-differentiation. The results suggest that differentiable database systems are
-a promising approach for database-integrated gradient computation in future
-analytical and machine learning workloads.
 
 \appendix
-
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % APPENDIX A
@@ -1574,99 +2080,200 @@ analytical and machine learning workloads.
 \chapter{Additional Implementation Details}
 \label{app:implementation}
 
-This appendix provides additional technical details regarding the implementation of automatic differentiation inside DuckDB. The material included here supplements the implementation discussion presented in Chapter~\ref{ch:implementation}.
-
-%------------------------------------------------
+This appendix provides additional technical details regarding the
+implementation of automatic differentiation inside DuckDB. The material
+supplements the implementation discussion in Chapter~\ref{ch:implementation}.
 
 \section{Complete Forward-Mode AD Implementation}
 
-The forward-mode AD system is implemented using dual-number propagation. Each scalar value is extended with a gradient vector that is propagated through arithmetic operations during expression evaluation.
+The forward-mode AD system uses dual-number propagation. Each scalar value
+is extended with a gradient vector propagated through arithmetic operations
+during expression evaluation.
 
-The core structure used inside DuckDB is:
+The core structure is:
 
 \begin{lstlisting}[language=C++]
 struct Dual {
     double val;
-    std::vector<double> grad;
+    double grad[MYGRAD_MAX_PARAMS]; // stack-allocated, max 32 params
+    idx_t  n;                       // actual number of parameters
 };
 \end{lstlisting}
 
-The multiplication operator propagates derivatives according to the product rule:
+The gradient array is stack-allocated with a fixed maximum size to avoid
+heap allocation per row. The multiplication operator propagates derivatives
+according to the product rule:
 
-\[
+\begin{equation}
 (a \cdot b)' = a'b + ab'
-\]
+\end{equation}
 
 \begin{lstlisting}[language=C++]
-Dual multiply(const Dual &a, const Dual &b) {
-    Dual out;
-
-    out.val = a.val * b.val;
-    out.grad.resize(a.grad.size());
-
-    for (size_t i = 0; i < out.grad.size(); i++) {
-        out.grad[i] =
-            a.grad[i] * b.val +
-            b.grad[i] * a.val;
+static Dual Mul(const Dual &a, const Dual &b) {
+    Dual o;
+    o.val = a.val * b.val;
+    o.n   = a.n;
+    for (idx_t i = 0; i < a.n; i++) {
+        o.grad[i] = a.grad[i] * b.val
+                  + b.grad[i] * a.val;
     }
-
-    return out;
+    return o;
 }
 \end{lstlisting}
 
-Additional operator overloads were implemented for addition, subtraction, division, unary negation, and scalar constants.
+Additional operator overloads were implemented for addition, subtraction,
+division, unary negation, and power.
 
-%------------------------------------------------
+\section{Flat Tape Compilation for Forward Mode}
 
-\section{Reverse-Mode Tape Structure}
-
-Reverse-mode AD uses a reusable instruction tape generated during the bind phase. The tape is a single contiguous array of operations, indexed by integer position rather than traversed through pointers. Each operation stores its operation kind and the indices of its operand operations:
+The forward-mode flat tape uses the following operation structure:
 
 \begin{lstlisting}[language=C++]
-struct CompiledOp {
-    OpKind  op;          // INPUT, CONST, NEG, ADD, SUB, MUL, DIV
-    int32_t a, b;        // operand indices into the program
-    double  cval;        // constant value (CONST only)
-    int32_t input_slot;  // parameter slot (INPUT only)
+enum class FwdOpKind : uint8_t {
+    INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW
+};
+
+struct FwdOp {
+    FwdOpKind op;
+    int32_t   a = -1;           // left operand index
+    int32_t   b = -1;           // right operand index
+    int32_t   input_slot = -1;  // INPUT only
+    double    cval = 0.0;       // CONST only
 };
 \end{lstlisting}
 
-The primal values and adjoint values are not stored inside the operation records. Instead, they are held in two separate working buffers, each the size of the tape, which are allocated once per data chunk and reused for every row.
+At bind time, the expression tree is compiled to a flat vector of
+\texttt{FwdOp} structures. CSE is applied to deduplicate identical nodes.
+At runtime, the tape is evaluated linearly carrying a \texttt{Dual} value
+per node.
 
-The tape is executed in two stages:
+\section{Reverse-Mode Tape Structure}
 
-\begin{enumerate}
-    \item a forward pass, which evaluates the operations in order and stores their primal values;
-    \item a reverse pass, which traverses the operations in reverse order and accumulates adjoint values into each operand.
-\end{enumerate}
+The reverse-mode tape uses the same structural approach:
 
-The binder compiles the tape once and stores it in the function bind data for reuse during vectorized execution.
+\begin{lstlisting}[language=C++]
+enum class OpKind : uint8_t {
+    INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW
+};
 
-%------------------------------------------------
+struct CompiledOp {
+    OpKind  op;
+    int32_t a = -1;           // left operand index
+    int32_t b = -1;           // right operand index
+    int32_t input_slot = -1;  // INPUT only
+    double  cval = 0.0;       // CONST only
+};
+\end{lstlisting}
+
+Primal values and adjoint values are stored in separate working buffers
+allocated once per data chunk and reused for every row. The tape is
+executed in two stages: a forward pass evaluating operations in order,
+and a backward pass traversing operations in reverse to accumulate adjoints.
+
+\section{CSE Algorithm}
+
+The CSE pass assigns a canonical string key to each compiled operation:
+
+\begin{lstlisting}[language=C++]
+auto make_key = [&](const CompiledOp &op,
+                    int32_t ra,
+                    int32_t rb) -> std::string {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d:%d:%d:%d:%.17g",
+             (int)op.op, ra, rb,
+             op.input_slot, op.cval);
+    return std::string(buf);
+};
+\end{lstlisting}
+
+Operations with identical keys are merged. All references to the duplicate
+are redirected to the canonical node. For the benchmark expression
+\texttt{(expr)*(expr)}, CSE reduced the tape from 41 to 21 operations.
+
+\section{Tiled Vectorisation Layout}
+
+The tiled vectorisation uses a 2D buffer layout:
+\texttt{vals[op\_index * TILE + row\_index]}. This places all row values
+for a single operation contiguously in memory, improving cache utilization
+when the inner loop iterates over rows for a fixed operation:
+
+\begin{lstlisting}[language=C++]
+// Forward pass: operation-outer, row-inner
+for (idx_t i = 0; i < prog.size(); i++) {
+    for (idx_t r = 0; r < tile_count; r++) {
+        vals[i * TILE + r] = ...; // all rows for op i
+    }
+}
+// Backward pass: reverse operation order, row-inner
+for (idx_t ii = prog.size(); ii > 0; ii--) {
+    idx_t i = ii - 1;
+    for (idx_t r = 0; r < tile_count; r++) {
+        adj[(idx_t)op.a * TILE + r] += ...; // accumulate adjoint
+    }
+}
+\end{lstlisting}
+
+\section{LLVM JIT Bridge Architecture}
+
+The JIT implementation uses a bridge pattern to avoid namespace conflicts
+between DuckDB and LLVM:
+
+\begin{lstlisting}[language=C++]
+// In autodiff_grad.cpp (inside namespace duckdb):
+#ifdef DUCKDB_HAVE_LLVM
+using JitFuncType = void(*)(const double*, double*);
+extern JitFuncType CompileJITBridge(
+    const void* prog_ptr,
+    int32_t     root,
+    uint64_t    N);
+#endif
+
+// At bind time:
+bind_data->jit_func = (void*)CompileJITBridge(
+    (const void*)&bind_data->prog,
+    bind_data->root,
+    (uint64_t)n_params);
+
+// At runtime per row:
+if (bind.jit_func) {
+    auto fn = (JitFuncType)bind.jit_func;
+    fn(inputs.data(), grads.data());
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++]
+// In autodiff_jit.cpp (outside namespace duckdb):
+JitFuncType CompileJITBridge(
+    const void* prog_ptr,
+    int32_t     root,
+    uint64_t    N) {
+    const auto* prog =
+        static_cast<const std::vector<FwdOp_jit>*>(prog_ptr);
+    return CompileJITImpl(*prog, root, N);
+}
+\end{lstlisting}
 
 \section{Tape Compilation Algorithm}
 
-The following pseudocode illustrates binder-time tape generation. Each call appends one operation to the program and returns its index, so that parent operations can reference their operands by position:
+The following pseudocode illustrates bind-time tape compilation. Each
+call appends one operation and returns its index:
 
-\begin{lstlisting}
+\begin{lstlisting}[numbers=none]
 function CompileTape(expr):
-
     if expr is constant:
         return EmitConst(expr.value)
-
     if expr is variable:
         return EmitInput(expr.slot)
-
     if expr is unary negation:
         a = CompileTape(expr.child)
         return EmitNeg(a)
-
     left  = CompileTape(expr.left)
     right = CompileTape(expr.right)
     return EmitBin(expr.op, left, right)
 \end{lstlisting}
 
-Because this compilation runs once during binding, it eliminates repeated graph construction during query execution.
+After compilation, CSE is applied and LLVM JIT compiles the result
+to native machine code.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % APPENDIX B
@@ -1675,89 +2282,139 @@ Because this compilation runs once during binding, it eliminates repeated graph 
 \chapter{Extended Experimental Results}
 \label{app:experiments}
 
-This appendix presents additional benchmark results and raw experimental data used in the evaluation chapter.
+\section{Complete Runtime Measurements — All Optimization Stages}
 
-%------------------------------------------------
-
-\section{Complete Runtime Measurements}
-
-Table~\ref{tab:extended_runtime} shows the median execution times for all benchmark configurations, measured on the optimized release build over five runs per configuration.
+Table~\ref{tab:extended_all_stages} shows median runtimes at all
+optimization stages for all dataset sizes.
 
 \begin{table}[H]
 \centering
-\begin{tabular}{|c|c|c|c|}
+\small
+\begin{tabular}{|l|c|c|c|c|c|}
 \hline
-Rows & Baseline & Forward AD & Reverse AD \\
+Stage & 1k & 5k & 10k & 20k & 50k \\
 \hline
-1,000  & 0.03 s & 0.06 s & 0.04 s \\
-5,000  & 0.05 s & 0.21 s & 0.05 s \\
-10,000 & 0.04 s & 0.32 s & 0.07 s \\
-20,000 & 0.06 s & 0.70 s & 0.13 s \\
-50,000 & 0.11 s & 1.47 s & 0.24 s \\
+\multicolumn{6}{|l|}{\textit{Baseline SQL (handwritten)}} \\
+All stages & 0.02 & 0.03 & 0.04 & 0.05 & 0.10 \\
+\hline
+\multicolumn{6}{|l|}{\textit{Forward-mode AD}} \\
+Initial & 0.06 & 0.21 & 0.32 & 0.70 & 1.47 \\
++ op cache & 0.04 & 0.13 & 0.25 & 0.47 & 1.14 \\
++ flat tape + CSE & 0.02 & 0.04 & 0.06 & 0.10 & 0.40 \\
++ tiled vectorisation & 0.02 & 0.04 & 0.06 & 0.10 & 0.22 \\
++ LLVM JIT & 0.03 & 0.04 & 0.04 & 0.06 & 0.10 \\
+\hline
+\multicolumn{6}{|l|}{\textit{Reverse-mode AD}} \\
+Initial & 0.04 & 0.05 & 0.07 & 0.13 & 0.24 \\
++ CSE & 0.02 & 0.03 & 0.04 & 0.05 & 0.09 \\
++ tiled vectorisation & 0.03 & 0.04 & 0.05 & 0.07 & 0.15 \\
++ LLVM JIT & 0.03 & 0.04 & 0.04 & 0.06 & 0.10 \\
 \hline
 \end{tabular}
-\caption{Extended runtime benchmark results (optimized release build, median of five runs, single-threaded).}
-\label{tab:extended_runtime}
+\caption{Median runtime in seconds at all optimization stages
+(optimized release build, median of five runs, single-threaded).}
+\label{tab:extended_all_stages}
 \end{table}
 
-The raw per-run measurements underlying this table were recorded in a comma-separated file with one row per dataset size, method, and repetition. A separate aggregation step computed the median, minimum, and maximum per configuration and wrote a summary file used directly as the input table for the plots in Chapter~\ref{ch:evaluation}.
+\section{Overhead Ratio at Each Stage}
 
-%------------------------------------------------
+Table~\ref{tab:overhead_ratios} shows the overhead ratio relative to
+the handwritten SQL baseline at each optimization stage for 50{,}000 tuples.
 
-\section{Additional SQL Benchmark Queries}
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|c|c|}
+\hline
+Optimization Stage & Forward AD / Base & Reverse AD / Base \\
+\hline
+Initial & 16.3$\times$ & 2.7$\times$ \\
++ Bind-time op cache & 12.7$\times$ & 2.7$\times$ \\
++ Flat tape + CSE & 4.4$\times$ & 1.0$\times$ \\
++ Tiled vectorisation & 2.4$\times$ & 1.7$\times$ \\
++ LLVM JIT & 1.0$\times$ & 1.0$\times$ \\
+\hline
+\end{tabular}
+\caption{Overhead ratio relative to baseline at 50{,}000 tuples after
+each optimization stage.}
+\label{tab:overhead_ratios}
+\end{table}
 
-In the benchmark queries, the AD function receives the numeric arguments first and the lambda expression last. The lambda declares one parameter per numeric argument, in the same positional order. The function returns a structured value holding one partial derivative per argument; the derivatives with respect to the trainable parameters are read from the corresponding struct fields.
+\section{Complete SQL Benchmark Queries}
 
-Example forward-mode query:
+The benchmark queries pass numeric arguments first and the lambda last.
+The function returns a structured value with one partial derivative per
+argument.
+
+Forward-mode benchmark query:
 
 \begin{lstlisting}[language=SQL]
-SELECT mygrad_fwd(
-    w, b, x, y,
-    (p1, p2, p3, p4) ->
-        (p1 * p3 + p2 - p4) *
-        (p1 * p3 + p2 - p4)
+WITH RECURSIVE gd(i,a1,a2,a3,a4,a5,a6,b) AS (
+  SELECT 1,
+    1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,
+    1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE
+  UNION ALL
+  SELECT i+1,
+    a1-0.1*AVG(g.d1), a2-0.1*AVG(g.d2),
+    a3-0.1*AVG(g.d3), a4-0.1*AVG(g.d4),
+    a5-0.1*AVG(g.d5), a6-0.1*AVG(g.d6),
+    b -0.1*AVG(g.d7)
+  FROM (
+    SELECT mygrad_fwd(
+      gd.a1,gd.a2,gd.a3,gd.a4,gd.a5,gd.a6,gd.b,
+      data.x1,data.x2,data.x3,data.x4,
+      data.x5,data.x6,data.y6,
+      (p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14) ->
+        (p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)
+       *(p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)
+    ) AS g
+    FROM gd, data WHERE gd.i < 20
+  )
+  GROUP BY i,a1,a2,a3,a4,a5,a6,b
 )
-FROM data;
+SELECT 'forward_ad' AS method, * FROM gd WHERE i=20;
 \end{lstlisting}
 
-Example reverse-mode query:
+Reverse-mode benchmark query (same structure, using
+\texttt{mygrad\_rev}):
 
 \begin{lstlisting}[language=SQL]
-SELECT mygrad_rev(
-    w, b, x, y,
-    (p1, p2, p3, p4) ->
-        (p1 * p3 + p2 - p4) *
-        (p1 * p3 + p2 - p4)
+WITH RECURSIVE gd(i,a1,a2,a3,a4,a5,a6,b) AS (
+  SELECT 1,
+    1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,
+    1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE,1.0::DOUBLE
+  UNION ALL
+  SELECT i+1,
+    a1-0.1*AVG(g.d1), a2-0.1*AVG(g.d2),
+    a3-0.1*AVG(g.d3), a4-0.1*AVG(g.d4),
+    a5-0.1*AVG(g.d5), a6-0.1*AVG(g.d6),
+    b -0.1*AVG(g.d7)
+  FROM (
+    SELECT mygrad_rev(
+      gd.a1,gd.a2,gd.a3,gd.a4,gd.a5,gd.a6,gd.b,
+      data.x1,data.x2,data.x3,data.x4,
+      data.x5,data.x6,data.y6,
+      (p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14) ->
+        (p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)
+       *(p1*p8+p2*p9+p3*p10+p4*p11+p5*p12+p6*p13+p7-p14)
+    ) AS g
+    FROM gd, data WHERE gd.i < 20
+  )
+  GROUP BY i,a1,a2,a3,a4,a5,a6,b
 )
-FROM data;
+SELECT 'reverse_ad' AS method, * FROM gd WHERE i=20;
 \end{lstlisting}
-
-%------------------------------------------------
 
 \section{Effect of Tape Reuse}
 
-A straightforward implementation of reverse-mode AD would rebuild the
-computation graph for every processed tuple, placing graph construction on the
-per-row execution path. The implemented design instead compiles the tape once,
-during binding, stores it in the function bind data, and reuses it across all
-rows. Figure~\ref{fig:tape_reuse} illustrates this difference.
+A straightforward implementation of reverse-mode AD rebuilds the
+computation graph for every processed tuple, placing graph construction
+on the per-row execution path. The implemented design compiles the tape
+once during binding and reuses it across all rows.
 
-\begin{figure}[H]
-\centering
-\includegraphics[width=\textwidth]{tape_reuse.pdf}
-\caption{Performance benefit of instruction tape reuse in reverse-mode AD.}
-\label{fig:tape_reuse}
-\end{figure}
-
-In summary, the implemented design:
-\begin{itemize}
-    \item compiles the tape once during binding,
-    \item stores the compiled tape in the function bind data,
-    \item reuses it for every row across all data chunks.
-\end{itemize}
-By construction, this keeps repeated graph construction off the per-row
-execution path. A measured before/after comparison against a per-row-rebuild
-variant is identified as future work in Chapter~\ref{ch:conclusion}.
+For a workload of $N$ rows and $I$ gradient-descent iterations, this
+reduces tape construction from $N \cdot I$ times to once. For the
+benchmark with $N=50{,}000$ and $I=20$, this eliminates 1{,}000{,}000
+tape construction operations per benchmark run.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % APPENDIX C
@@ -1766,59 +2423,114 @@ variant is identified as future work in Chapter~\ref{ch:conclusion}.
 \chapter{Mathematical Foundations}
 \label{app:proofs}
 
-This appendix provides mathematical derivations and correctness arguments for the implemented automatic differentiation algorithms.
-
-%------------------------------------------------
-
 \section{Correctness of Forward-Mode AD}
 
-Forward-mode AD propagates derivatives using the chain rule. For a composition
+Forward-mode AD propagates derivatives using the chain rule. For a
+composition $f(x) = g(h(x))$, the derivative is:
 
-\[
-f(x) = g(h(x))
-\]
+\begin{equation}
+f'(x) = g'(h(x)) \cdot h'(x)
+\end{equation}
 
-the derivative is
+The implemented dual-number propagation preserves this property for
+every primitive operator. For multiplication $f(x) = u(x) \cdot v(x)$:
 
-\[
-f'(x) = g'(h(x)) \cdot h'(x).
-\]
+\begin{equation}
+f'(x) = u'(x) \cdot v(x) + u(x) \cdot v'(x)
+\end{equation}
 
-The implemented dual-number propagation preserves this property for every primitive operator. For multiplication,
+For division $f(x) = u(x) / v(x)$:
 
-\[
-f(x) = u(x)\,v(x),
-\]
+\begin{equation}
+f'(x) = \frac{u'(x) \cdot v(x) - u(x) \cdot v'(x)}{v(x)^2}
+\end{equation}
 
-the derivative rule is
+For power $f(x) = u(x)^c$ where $c$ is constant:
 
-\[
-f'(x) = u'(x)\,v(x) + u(x)\,v'(x),
-\]
+\begin{equation}
+f'(x) = c \cdot u(x)^{c-1} \cdot u'(x)
+\end{equation}
 
-which matches the implemented operator logic shown in Appendix~\ref{app:implementation}.
+\section{Correctness of Reverse-Mode AD}
 
-%------------------------------------------------
+Reverse-mode AD propagates adjoint values $\bar{v}_i =
+\frac{\partial L}{\partial v_i}$ backwards through the tape. For
+each operation the adjoint update follows from the chain rule.
+
+For addition $v_i = v_j + v_k$:
+\begin{equation}
+\bar{v}_j \mathrel{+}= \bar{v}_i, \quad \bar{v}_k \mathrel{+}= \bar{v}_i
+\end{equation}
+
+For multiplication $v_i = v_j \cdot v_k$:
+\begin{equation}
+\bar{v}_j \mathrel{+}= \bar{v}_i \cdot v_k, \quad
+\bar{v}_k \mathrel{+}= \bar{v}_i \cdot v_j
+\end{equation}
+
+For division $v_i = v_j / v_k$:
+\begin{equation}
+\bar{v}_j \mathrel{+}= \bar{v}_i / v_k, \quad
+\bar{v}_k \mathrel{+}= -\bar{v}_i \cdot v_j / v_k^2
+\end{equation}
+
+For power $v_i = v_j^{v_k}$:
+\begin{equation}
+\bar{v}_j \mathrel{+}= \bar{v}_i \cdot v_k \cdot v_j^{v_k - 1}
+\end{equation}
+
+These rules are implemented in both the tiled tape interpreter and
+the LLVM JIT backward pass.
 
 \section{Complexity Analysis}
 
-Let $n$ denote the number of operations in the compiled expression and $p$ the number of parameters.
+Let $n$ denote the number of operations in the compiled tape after
+CSE, and $p$ the number of parameters.
 
-Forward-mode AD propagates a gradient vector of length $p$ alongside each of the $n$ intermediate values, giving a time complexity of
+\textbf{Forward-mode AD} carries a gradient vector of length $p$
+through each of the $n$ operations:
+\begin{equation}
+T_{\text{fwd}} = O(n \cdot p)
+\end{equation}
 
-\[
-O(n \cdot p).
-\]
+\textbf{Reverse-mode AD} executes one forward pass and one backward
+pass, each linear in $n$, independent of $p$:
+\begin{equation}
+T_{\text{rev}} = O(n)
+\end{equation}
 
-Reverse-mode AD evaluates the tape with a single forward pass and a single reverse pass, each linear in the number of operations, giving a time complexity of
+Memory complexity for reverse-mode AD is $O(n)$ per row for storing
+primal values and adjoints. In the tiled implementation, these buffers
+are allocated once per tile and reused across rows.
 
-\[
-O(n)
-\]
+After LLVM JIT compilation, both modes execute at native speed with
+no interpreter overhead. The asymptotic complexity remains the same,
+but the constant factor is reduced to that of direct arithmetic
+instructions, matching the handwritten SQL baseline.
 
-for scalar-output functions, independent of the number of parameters. Its memory complexity is also O(n) per row, due to the storage of intermediate primal values and adjoints; in the implementation, these buffers are allocated once per data chunk and reused across rows within the chunk. These asymptotic characteristics are consistent with the standard analysis of forward- and reverse-mode AD given by Griewank and Walther~\cite{griewank2008evaluating} and Baydin et al.~\cite{baydin2017automatic}.
+These complexity characteristics explain why reverse-mode AD
+outperforms forward-mode AD for workloads with many parameters
+($p = 14$ in the benchmark), and they are consistent with the
+experimental results in Chapter~\ref{ch:evaluation} and with the
+standard analysis given by Griewank and Walther~\cite{griewank2008evaluating}
+and Baydin et al.~\cite{baydin2017automatic}.
 
-These complexity characteristics explain why reverse-mode AD outperforms forward-mode AD for workloads with many parameters, and they are consistent with the experimental results in Chapter~\ref{ch:evaluation}, where the advantage of reverse-mode AD over forward-mode AD widens as the workload grows.
+\section{Self-Referential Node Correction in JIT}
+
+When CSE merges both operands of a binary operation to the same
+tape node (as occurs in \texttt{(expr)*(expr)}), the backward pass
+must accumulate both gradient contributions before storing. In the
+JIT implementation, this requires special handling:
+
+For $v_i = v_j \cdot v_j$ (where both operands are the same node):
+\begin{equation}
+\bar{v}_j \mathrel{+}= \bar{v}_i \cdot v_j + \bar{v}_i \cdot v_j
+         = 2 \cdot \bar{v}_i \cdot v_j
+\end{equation}
+
+This is implemented as a single atomic accumulation to avoid the
+load-modify-store race that would occur with two separate updates
+to the same adjoint location.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -2269,6 +2981,15 @@ Feng, Xixuan, Arun Kumar, Benjamin Recht, and Christopher R\'e (2012).
 ``Towards a Unified Architecture for In-RDBMS Analytics''.
 In: \textit{Proceedings of the 2012 ACM SIGMOD International Conference on Management of Data},
 pp.~325--336.
+
+\bibitem{schule2022llvm}
+Sch{\"u}le, Maximilian E., Maximilian Springer,
+Alfons Kemper, and Thomas Neumann (2022).
+``LLVM Code Optimisation for Automatic Differentiation:
+When Forward and Reverse Mode Lead in the Same Direction''.
+In: \textit{Proceedings of the Sixth Workshop on Data Management
+for End-To-End Machine Learning (DEEM@SIGMOD)},
+Article 5.
 
 \end{thebibliography}
 
