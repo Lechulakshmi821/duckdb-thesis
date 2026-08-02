@@ -2,7 +2,7 @@
 set -e
 
 DUCKDB_BIN="./build/release/duckdb"
-SIZES=(1000 5000 10000 20000 50000)
+SIZES=(1000 5000 10000 20000 50000 100000 200000 500000 1000000)
 RUNS=5
 OUT_CSV="stored_lambda_scaling.csv"
 

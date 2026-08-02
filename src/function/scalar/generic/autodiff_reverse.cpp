@@ -26,15 +26,10 @@
 #include <unordered_map>
 #include <vector>
 
-#define DUCKDB_HAVE_LLVM
-#ifdef DUCKDB_HAVE_LLVM
-using RevJitFuncType = void(*)(const double*, double*);
-extern RevJitFuncType CompileRevJITBridge(const void* prog_ptr, const void* root_ptr, const void* input_node_ptr, uint64_t N);
-#endif
 
 namespace duckdb {
 
-static constexpr idx_t MYGRAD_REV_TILE_SIZE = 256;
+static constexpr idx_t MYGRAD_REV_TILE_SIZE = 128;
 
 //------------------------------------------------------------------------------
 // RowInput
@@ -98,7 +93,7 @@ static inline bool NameToSlot(const string &raw_in, idx_t param_cnt, idx_t &slot
 //------------------------------------------------------------------------------
 // Compiled reverse-mode "bytecode"
 //------------------------------------------------------------------------------
-enum class OpKind : uint8_t { INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW };
+enum class OpKind : uint8_t { INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW, LOG, EXP };
 
 struct CompiledOp {
 	OpKind op;
@@ -272,9 +267,6 @@ struct AutoDiffGradCompiledBindData : public FunctionData {
 	std::vector<int32_t> input_node;
 
 	std::vector<SymProg> sym_derivs;
-#ifdef DUCKDB_HAVE_LLVM
-	void* jit_func = nullptr;
-#endif
 	std::vector<int32_t> sym_roots;
 	std::vector<int32_t> sym_fwd;
 	std::vector<double> sym_scratch;
@@ -348,6 +340,16 @@ static inline int32_t EmitBin(std::vector<CompiledOp> &prog, OpKind k, int32_t a
 }
 
 //------------------------------------------------------------------------------
+// Capture reference mapping: DuckDB's "#N" capture ref numbers do not
+// necessarily start at 0 or match the captures[] array index directly.
+// We map each distinct #N to a sequential position, in first-seen order,
+// which matches the order captures[] was populated regardless of DuckDB's
+// internal numbering offset.
+//------------------------------------------------------------------------------
+static thread_local std::unordered_map<idx_t, idx_t> g_capture_ref_map;
+static void ResetCaptureRefMap() { g_capture_ref_map.clear(); }
+
+//------------------------------------------------------------------------------
 // Compiler: Expression -> prog
 //------------------------------------------------------------------------------
 static int32_t CompileExpr(Expression &expr,
@@ -376,11 +378,22 @@ static int32_t CompileExpr(Expression &expr,
 		string nm = expr.alias;
 		if (nm.empty()) nm = expr.ToString();
 		if (!nm.empty() && nm[0] == '#') {
-			for (idx_t ci = 0; ci < captures.size(); ci++) {
-				if (captures[ci]->expression_class == ExpressionClass::BOUND_CONSTANT) {
-					auto &cc = captures[ci]->Cast<BoundConstantExpression>();
-					return EmitConst(prog, cc.value.GetValue<double>());
-				}
+			idx_t raw_num = 0;
+			for (idx_t k = 1; k < nm.size(); k++) {
+				if (std::isdigit((unsigned char)nm[k])) raw_num = raw_num * 10 + (idx_t)(nm[k] - '0');
+			}
+			idx_t seq_idx;
+			auto it = g_capture_ref_map.find(raw_num);
+			if (it != g_capture_ref_map.end()) {
+				seq_idx = it->second;
+			} else {
+				seq_idx = g_capture_ref_map.size();
+				g_capture_ref_map[raw_num] = seq_idx;
+			}
+			if (seq_idx < captures.size() &&
+			    captures[seq_idx]->expression_class == ExpressionClass::BOUND_CONSTANT) {
+				auto &cc = captures[seq_idx]->Cast<BoundConstantExpression>();
+				return EmitConst(prog, cc.value.GetValue<double>());
 			}
 			return EmitConst(prog, 0.0);
 		}
@@ -429,6 +442,14 @@ static int32_t CompileExpr(Expression &expr,
 		if (ch.size() == 1 && (name.find("neg") != string::npos || name == "-")) {
 			auto a = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out, captures);
 			return EmitNeg(prog, a);
+		}
+		if (ch.size() == 1 && name == "exp") {
+			auto a = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out, captures);
+			CompiledOp o; o.op = OpKind::EXP; o.a = a; prog.push_back(o); return (int32_t)prog.size() - 1;
+		}
+		if (ch.size() == 1 && (name == "ln" || name == "log")) {
+			auto a = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out, captures);
+			CompiledOp o; o.op = OpKind::LOG; o.a = a; prog.push_back(o); return (int32_t)prog.size() - 1;
 		}
 		if (ch.size() == 2) {
 			auto L = CompileExpr(*ch[0], param_cnt, prog, input_cache, input_node_out, captures);
@@ -533,15 +554,6 @@ static void FinishAutoDiffBindData(AutoDiffGradCompiledBindData &bind_data, idx_
 		bind_data.sym_roots[p]  = dr;
 	}
 
-#ifdef DUCKDB_HAVE_LLVM
-	if (!bind_data.prog.empty()) {
-		bind_data.jit_func = (void*)CompileRevJITBridge(
-			(const void*)&bind_data.prog,
-			(const void*)&bind_data.root,
-			(const void*)&bind_data.input_node,
-			(uint64_t)n_params);
-	}
-#endif
 }
 
 //------------------------------------------------------------------------------
@@ -557,6 +569,8 @@ static OpKind ConvertStoredOpKind(StoredOpKind k) {
 	case StoredOpKind::MUL:   return OpKind::MUL;
 	case StoredOpKind::DIV:   return OpKind::DIV;
 	case StoredOpKind::POW:   return OpKind::POW;
+	case StoredOpKind::LOG:   return OpKind::LOG;
+	case StoredOpKind::EXP:   return OpKind::EXP;
 	}
 	throw InternalException("stored lambda: unknown op kind");
 }
@@ -612,6 +626,8 @@ static void RunTapeSingleRow(const std::vector<CompiledOp> &prog, int32_t root,
 		case OpKind::MUL:   vals[i] = vals[(idx_t)op.a] * vals[(idx_t)op.b]; break;
 		case OpKind::DIV:   vals[i] = vals[(idx_t)op.a] / vals[(idx_t)op.b]; break;
 		case OpKind::POW:   vals[i] = std::pow(vals[(idx_t)op.a], vals[(idx_t)op.b]); break;
+		case OpKind::EXP:   vals[i] = std::exp(vals[(idx_t)op.a]); break;
+		case OpKind::LOG:   vals[i] = std::log(vals[(idx_t)op.a]); break;
 		default: vals[i] = 0.0; break;
 		}
 	}
@@ -639,6 +655,14 @@ static void RunTapeSingleRow(const std::vector<CompiledOp> &prog, int32_t root,
 			double lv = vals[(idx_t)op.a], rv = vals[(idx_t)op.b];
 			adj[(idx_t)op.a] += adj[i] * rv * std::pow(lv, rv - 1.0);
 			adj[(idx_t)op.b] += (lv > 0.0) ? adj[i] * std::pow(lv, rv) * std::log(lv) : 0.0;
+			break;
+		}
+		case OpKind::EXP: {
+			adj[(idx_t)op.a] += adj[i] * vals[i];
+			break;
+		}
+		case OpKind::LOG: {
+			adj[(idx_t)op.a] += adj[i] / vals[(idx_t)op.a];
 			break;
 		}
 		default: break;
@@ -748,6 +772,7 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 	std::fill(bind_data->input_node.begin(), bind_data->input_node.end(), -1);
 
 	std::vector<int32_t> input_cache(n_params, -1);
+	ResetCaptureRefMap();
 	bind_data->root = CompileExpr(*bind_data->lambda_expr, n_params, bind_data->prog, input_cache, bind_data->input_node, ble.captures);
 
 	ApplyCSE(bind_data->prog, bind_data->root);
@@ -816,18 +841,6 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 	const auto &prog = bind.prog;
 	const int32_t root = bind.root;
 
-#ifdef DUCKDB_HAVE_LLVM
-	if (bind.jit_func) {
-		auto fn = (RevJitFuncType)bind.jit_func;
-		std::vector<double> inputs(N), grads(N);
-		for (idx_t r = 0; r < count; r++) {
-			for (idx_t j = 0; j < N; j++) inputs[j] = in.Get(j, r);
-			fn(inputs.data(), grads.data());
-			for (idx_t j = 0; j < N; j++) child_ptrs[j][r] = grads[j];
-		}
-		return;
-	}
-#endif
 	if (false && !bind.sym_derivs.empty() && (int32_t)bind.sym_derivs.size() == (int32_t)N) {
 		idx_t max_sz = 0;
 		for (idx_t j = 0; j < N; j++) if (!bind.sym_derivs[j].empty()) max_sz = std::max(max_sz, (idx_t)bind.sym_derivs[j].size());
@@ -873,6 +886,12 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 				break;
 			case OpKind::POW:
 				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = std::pow(vals[(idx_t)op.a * TILE + r], vals[(idx_t)op.b * TILE + r]);
+				break;
+			case OpKind::EXP:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = std::exp(vals[(idx_t)op.a * TILE + r]);
+				break;
+			case OpKind::LOG:
+				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = std::log(vals[(idx_t)op.a * TILE + r]);
 				break;
 			default:
 				for (idx_t r = 0; r < tile_count; r++) vals[i * TILE + r] = 0.0;
@@ -937,6 +956,16 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 					const double rv = vals[(idx_t)op.b * TILE + r];
 					adj[(idx_t)op.a * TILE + r] += a * rv * std::pow(lv, rv - 1.0);
 					adj[(idx_t)op.b * TILE + r] += (lv > 0.0) ? a * std::pow(lv, rv) * std::log(lv) : 0.0;
+				}
+				break;
+			case OpKind::EXP:
+				for (idx_t r = 0; r < tile_count; r++) {
+					adj[(idx_t)op.a * TILE + r] += adj[i * TILE + r] * vals[i * TILE + r];
+				}
+				break;
+			case OpKind::LOG:
+				for (idx_t r = 0; r < tile_count; r++) {
+					adj[(idx_t)op.a * TILE + r] += adj[i * TILE + r] / vals[(idx_t)op.a * TILE + r];
 				}
 				break;
 			default:

@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-enum class StoredOpKind : uint8_t { INPUT, CONST, NEG, ADD, SUB, MUL, DIV, POW };
+enum class StoredOpKind : uint8_t { INPUT, CONST, NEG, ADD, SUB, MUL, DIV, POW, LOG, EXP };
 struct StoredCompiledOp {
 	StoredOpKind op;
 	int32_t a = -1, b = -1;

@@ -23,12 +23,7 @@
 #include <vector>
 #include <unordered_map>
 
-#define DUCKDB_HAVE_LLVM
 // Bridge to JIT implementation in autodiff_jit.cpp (outside duckdb namespace)
-#ifdef DUCKDB_HAVE_LLVM
-using JitFuncType = void(*)(const double*, double*);
-extern JitFuncType CompileJITBridge(const void* prog_ptr, int32_t root, uint64_t N);
-#endif
 
 namespace duckdb {
 
@@ -42,7 +37,7 @@ enum class OpKind { ADD, SUB, MUL, DIV, NEG, UNKNOWN };
 // ============================================================================
 // Bind data: store the lambda expression + how many lambda parameters it has
 // ============================================================================
-enum class FwdOpKind : uint8_t { INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW };
+enum class FwdOpKind : uint8_t { INPUT, CONST, ADD, SUB, MUL, DIV, NEG, POW, LOG, EXP };
 
 struct FwdOp {
 	FwdOpKind op;
@@ -59,9 +54,6 @@ struct AutoDiffGradBindData : public FunctionData {
 	std::unordered_map<Expression*, OpKind> op_cache;
 	std::vector<FwdOp> prog;
 	int32_t root = -1;
-#ifdef DUCKDB_HAVE_LLVM
-	void* jit_func = nullptr;
-#endif
 	// --- Dynamic (per-row) stored-lambda support ---
 	bool is_dynamic_lambda = false;
 	struct DynamicTapeEntry {
@@ -345,7 +337,14 @@ static int32_t CompileFwd(Expression &expr, idx_t param_cnt,
 		auto &fn = expr.Cast<BoundFunctionExpression>();
 		auto &ch = fn.children;
 		const string name = StringUtil::Lower(fn.function.name);
-		if (ch.size()==1) { auto a=CompileFwd(*ch[0],param_cnt,prog,captures); FwdOp o; o.op=FwdOpKind::NEG; o.a=a; prog.push_back(o); return (int32_t)prog.size()-1; }
+		if (ch.size()==1) {
+			auto a=CompileFwd(*ch[0],param_cnt,prog,captures);
+			FwdOp o;
+			if (name=="exp") o.op=FwdOpKind::EXP;
+			else if (name=="ln"||name=="log") o.op=FwdOpKind::LOG;
+			else o.op=FwdOpKind::NEG;
+			o.a=a; prog.push_back(o); return (int32_t)prog.size()-1;
+		}
 		if (ch.size()==2) {
 			auto L=CompileFwd(*ch[0],param_cnt,prog,captures);
 			auto R=CompileFwd(*ch[1],param_cnt,prog,captures);
@@ -502,6 +501,8 @@ static FwdOpKind ConvertStoredOpKindToFwd(StoredOpKind k) {
 	case StoredOpKind::MUL:   return FwdOpKind::MUL;
 	case StoredOpKind::DIV:   return FwdOpKind::DIV;
 	case StoredOpKind::POW:   return FwdOpKind::POW;
+	case StoredOpKind::LOG:   return FwdOpKind::LOG;
+	case StoredOpKind::EXP:   return FwdOpKind::EXP;
 	}
 	throw InternalException("stored lambda (fwd): unknown op kind");
 }
@@ -591,6 +592,18 @@ static void RunFwdTapeSingleRow(const std::vector<FwdOp> &prog, int32_t root,
 			}
 			break;
 		}
+		case FwdOpKind::EXP: {
+			double ev = std::exp(val[(idx_t)op.a]);
+			val[i] = ev;
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = ev * grad[(idx_t)op.a*N+j];
+			break;
+		}
+		case FwdOpKind::LOG: {
+			double av = val[(idx_t)op.a];
+			val[i] = std::log(av);
+			for (idx_t j = 0; j < N; j++) grad[i*N+j] = grad[(idx_t)op.a*N+j] / av;
+			break;
+		}
 		default:
 			val[i] = 0.0;
 			for (idx_t j = 0; j < N; j++) grad[i*N+j] = 0.0;
@@ -655,9 +668,6 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 				bind_data->prog.push_back(op);
 			}
 			bind_data->root = parsed.root;
-#ifdef DUCKDB_HAVE_LLVM
-			bind_data->jit_func = (void*)CompileJITBridge((const void*)&bind_data->prog, bind_data->root, (uint64_t)n_numeric_args);
-#endif
 			return std::move(bind_data);
 		}
 		if (last->return_type.id() == LogicalTypeId::STORED_LAMBDA) {
@@ -717,10 +727,6 @@ AutoDiffGradBind(ClientContext &, ScalarFunction &bound_function, vector<unique_
 		bind_data->root=remap[(idx_t)bind_data->root];
 		bind_data->prog=std::move(new_prog);
 	}
-#ifdef DUCKDB_HAVE_LLVM
-	bind_data->jit_func = (void*)CompileJITBridge((const void*)&bind_data->prog, bind_data->root, (uint64_t)n_params);
-	Printer::Print(bind_data->jit_func ? "[JIT] compiled OK" : "[JIT] failed");
-#endif
 	return std::move(bind_data);
 }
 
@@ -771,17 +777,6 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 	}
 
 	// JIT path: native code execution
-#ifdef DUCKDB_HAVE_LLVM
-	if (bind.jit_func) {
-		auto fn = (JitFuncType)bind.jit_func;
-		std::vector<double> inputs(N), grads(N);
-		for (idx_t r = 0; r < count; r++) {
-			for (idx_t j = 0; j < N; j++) inputs[j] = in.Get(j, r);
-			fn(inputs.data(), grads.data());
-			for (idx_t j = 0; j < N; j++) out_ptr[j][r] = grads[j];
-		}
-	} else
-#endif
 	// Use compiled tape with tiled vectorisation
 	if (!bind.prog.empty() && bind.root >= 0) {
 		const idx_t sz = (idx_t)bind.root + 1;
@@ -852,6 +847,20 @@ static void AutoDiffGradExecute(DataChunk &args, ExpressionState &state, Vector 
 							if (lv > 0.0) dv += pv * std::log(lv) * grad[(idx_t)op.b*TILE*N+r*N+j];
 							grad[i*TILE*N+r*N+j] = dv;
 						}
+					}
+					break;
+				case FwdOpKind::EXP:
+					for (idx_t r = 0; r < tc; r++) {
+						double ev = std::exp(val[(idx_t)op.a*TILE+r]);
+						val[i*TILE+r] = ev;
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = ev * grad[(idx_t)op.a*TILE*N+r*N+j];
+					}
+					break;
+				case FwdOpKind::LOG:
+					for (idx_t r = 0; r < tc; r++) {
+						double av = val[(idx_t)op.a*TILE+r];
+						val[i*TILE+r] = std::log(av);
+						for (idx_t j = 0; j < N; j++) grad[i*TILE*N+r*N+j] = grad[(idx_t)op.a*TILE*N+r*N+j] / av;
 					}
 					break;
 				default:

@@ -89,6 +89,14 @@ static int32_t CompileParsedExpr(ParsedExpression &expr,
 			auto a = CompileParsedExpr(*ch[0], name_to_slot, prog, input_cache);
 			return EmitNeg(prog, a);
 		}
+		if (ch.size() == 1 && name == "exp") {
+			auto a = CompileParsedExpr(*ch[0], name_to_slot, prog, input_cache);
+			StoredCompiledOp o; o.op = StoredOpKind::EXP; o.a = a; prog.push_back(o); return (int32_t)prog.size() - 1;
+		}
+		if (ch.size() == 1 && (name == "ln" || name == "log")) {
+			auto a = CompileParsedExpr(*ch[0], name_to_slot, prog, input_cache);
+			StoredCompiledOp o; o.op = StoredOpKind::LOG; o.a = a; prog.push_back(o); return (int32_t)prog.size() - 1;
+		}
 		if (ch.size() == 2) {
 			auto L = CompileParsedExpr(*ch[0], name_to_slot, prog, input_cache);
 			auto R = CompileParsedExpr(*ch[1], name_to_slot, prog, input_cache);
